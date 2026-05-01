@@ -1,0 +1,5 @@
+torch>=2.2
+transformers>=4.45
+accelerate>=0.34
+sentencepiece>=0.2
+protobuf>=4.25
