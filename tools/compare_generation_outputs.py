@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from traceable_speculative_decode import PROMPT, choose_device, generate as speculative_generate
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from decoders.first_principles_speculative_decoder import PROMPT, choose_device, generate as speculative_generate
 
 
 def first_mismatch(a: list[int], b: list[int]) -> int | None:

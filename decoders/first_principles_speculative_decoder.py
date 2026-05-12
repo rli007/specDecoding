@@ -476,7 +476,7 @@ def generate(
 
     Pass a list as trace_steps to collect one SpeculativeStepTrace per
     speculative iteration. The return value stays a tensor so this mirrors
-    example_generation.txt's generate shape.
+    reference/static_cache_generation_reference.txt's generate shape.
     """
     validate_generate_inputs(prompt_token_ids, max_new_tokens, num_assistant_tokens)
     if draft_model is None or num_assistant_tokens == 0:

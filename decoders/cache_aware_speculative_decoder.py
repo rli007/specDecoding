@@ -18,7 +18,10 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from manual_greedy_spec_decode import PROMPT, SpecDecodeResult, assistant_draft, choose_device
+try:
+    from .simple_greedy_speculative_decoder import PROMPT, SpecDecodeResult, assistant_draft, choose_device
+except ImportError:
+    from simple_greedy_speculative_decoder import PROMPT, SpecDecodeResult, assistant_draft, choose_device
 
 
 def argmax_next(logits: torch.Tensor) -> torch.Tensor:

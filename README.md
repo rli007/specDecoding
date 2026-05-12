@@ -47,7 +47,7 @@ KV cache / model kwargs are updated
 repeat
 ```
 
-`trace_hf_spec_decode.py` monkey-patches the local Transformers install where
+`tools/trace_huggingface_assisted_generation.py` monkey-patches the local Transformers install where
 possible and prints calls through `GenerationMixin.generate`,
 `get_generation_mode`, `_assisted_decoding`,
 `AssistedCandidateGenerator.get_candidates`, assistant forwards, and target
@@ -86,7 +86,7 @@ else reject at first mismatch and use target token
 If all draft tokens are accepted, append them and then append one extra target
 token if `max_new_tokens` allows.
 
-The tensor-level entry point is `traceable_speculative_decode.generate(...)`:
+The tensor-level entry point is `decoders.first_principles_speculative_decoder.generate(...)`:
 
 ```python
 output_ids = generate(
@@ -106,7 +106,7 @@ does not call `target.generate(...)` or inspect target/draft internals.
 To inspect every speculative step, run:
 
 ```bash
-python traceable_speculative_decode.py
+python decoders/first_principles_speculative_decoder.py
 ```
 
 That prints draft forward input lengths, target verification input length,
@@ -116,25 +116,25 @@ tokens, and the final output.
 For a longer paragraph-sized run:
 
 ```bash
-python traceable_speculative_decode.py --paragraph
+python decoders/first_principles_speculative_decoder.py --paragraph
 ```
 
 To print top-k logits at each assistant and target decision:
 
 ```bash
-python traceable_speculative_decode.py --max-new-tokens 40 --show-logits --top-k-logits 5
+python decoders/first_principles_speculative_decoder.py --max-new-tokens 40 --show-logits --top-k-logits 5
 ```
 
 To save the full next-token logit vectors used by both models:
 
 ```bash
-python traceable_speculative_decode.py --paragraph --logits-out spec_logits.pt
+python decoders/first_principles_speculative_decoder.py --paragraph --logits-out spec_logits.pt
 ```
 
 To avoid reloading model weights between prompts, use interactive mode:
 
 ```bash
-python traceable_speculative_decode.py --interactive
+python decoders/first_principles_speculative_decoder.py --interactive
 ```
 
 The target and assistant weights load once, then each prompt you type reuses the
@@ -147,7 +147,7 @@ such as `spec_logits_2.pt`.
 For a larger Llama-family experiment, use the dedicated session file:
 
 ```bash
-python llama_spec_session.py
+python tools/interactive_llama_speculative_session.py
 ```
 
 By default it uses:
@@ -161,7 +161,7 @@ This loads the models once and then lets you enter many prompts. To use the
 instruction-tuned pair:
 
 ```bash
-python llama_spec_session.py \
+python tools/interactive_llama_speculative_session.py \
   --target-model meta-llama/Meta-Llama-3-8B-Instruct \
   --assistant-model meta-llama/Llama-3.2-1B-Instruct
 ```
@@ -183,7 +183,7 @@ low_cpu_mem_usage=True
 For the first MPS test, run:
 
 ```bash
-python llama_spec_session.py --device mps --max-new-tokens 1 --draft-len 1
+python tools/interactive_llama_speculative_session.py --device mps --max-new-tokens 1 --draft-len 1
 ```
 
 During generation, the session prints before and after every assistant and
@@ -223,20 +223,27 @@ prompt -> prefill -> assistant draft -> target verify -> accept/reject -> update
 
 ## Files
 
-- `trace_hf_spec_decode.py`: runs real HF greedy and assisted generation, then
-  traces the assisted path.
-- `inspect_hf_spec_source.py`: prints local Transformers source paths and
-  search terms.
-- `traceable_speculative_decode.py`: isolated tensor-level speculative decoder
-  with structured per-step tracing.
-- `llama_spec_session.py`: long-running Llama-oriented session that loads a
-  larger target and smaller assistant once, then reuses them for many prompts.
-- `manual_greedy_spec_decode.py`: clear manual speculative decoding, including
-  the earlier verbose tokenizer/prompt-oriented demo.
-- `manual_greedy_spec_decode_cached.py`: cached-style version that exposes
-  prefill, decode, `past_key_values`, `cache_position`, and cache rebuilds.
-- `compare_outputs.py`: compares target greedy, HF assisted, and manual
-  speculative outputs.
+- `decoders/first_principles_speculative_decoder.py`: isolated tensor-level
+  speculative decoder with structured per-step tracing.
+- `decoders/simple_greedy_speculative_decoder.py`: clear manual speculative
+  decoding, including the earlier verbose tokenizer/prompt-oriented demo.
+- `decoders/cache_aware_speculative_decoder.py`: cached-style version that
+  exposes prefill, decode, `past_key_values`, `cache_position`, and cache
+  rebuilds.
+- `tools/trace_huggingface_assisted_generation.py`: runs real HF greedy and
+  assisted generation, then traces the assisted path.
+- `tools/locate_huggingface_generation_source.py`: prints local Transformers
+  source paths and search terms.
+- `tools/compare_generation_outputs.py`: compares target greedy, HF assisted,
+  and manual speculative outputs.
+- `tools/interactive_llama_speculative_session.py`: long-running Llama-oriented
+  session that loads a larger target and smaller assistant once, then reuses
+  them for many prompts.
+- `reference/recommended_model_pairs.txt`: compatible target/assistant pairs.
+- `reference/static_cache_generation_reference.txt`: reference static-cache
+  generation example this repo mirrors.
+- `reference/sample_speculative_trace.txt`: saved trace output from an example
+  speculative decoding run.
 
 ## How To Run
 
@@ -249,19 +256,19 @@ pip install -r requirements.txt
 Run:
 
 ```bash
-python trace_hf_spec_decode.py
-python inspect_hf_spec_source.py
-python traceable_speculative_decode.py
-python manual_greedy_spec_decode.py
-python manual_greedy_spec_decode_cached.py
-python compare_outputs.py
+python tools/trace_huggingface_assisted_generation.py
+python tools/locate_huggingface_generation_source.py
+python decoders/first_principles_speculative_decoder.py
+python decoders/simple_greedy_speculative_decoder.py
+python decoders/cache_aware_speculative_decoder.py
+python tools/compare_generation_outputs.py
 ```
 
 If your IDE uses Apple system Python and cannot import `torch`, run with the
 Anaconda interpreter:
 
 ```bash
-/opt/anaconda3/bin/python trace_hf_spec_decode.py
+/opt/anaconda3/bin/python tools/trace_huggingface_assisted_generation.py
 ```
 
 ## Expected Result
@@ -271,7 +278,7 @@ For greedy decoding:
 - normal target generation should match HF assisted generation
 - manual speculative decoding should match normal target generation
 
-`compare_outputs.py` prints decoded outputs, token IDs, equality checks, and the
+`tools/compare_generation_outputs.py` prints decoded outputs, token IDs, equality checks, and the
 first mismatch if something diverges.
 
 ## Known Limitations
@@ -279,7 +286,7 @@ first mismatch if something diverges.
 - Initial manual version recomputes full sequences for clarity.
 - Sampling is not supported.
 - Batch generation is not supported; the first-principles implementation matches
-  the single-batch style in `example_generation.txt`.
+  the single-batch style in `reference/static_cache_generation_reference.txt`.
 - Llama is not supported at first.
 - Quantization is not included.
 - Static-cache export is not included yet.
