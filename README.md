@@ -230,12 +230,18 @@ prompt -> prefill -> assistant draft -> target verify -> accept/reject -> update
 - `decoders/cache_aware_speculative_decoder.py`: cached-style version that
   exposes prefill, decode, `past_key_values`, `cache_position`, and cache
   rebuilds.
+- `decoders/stripped_down_llama_assisted_decoder.py`: Llama 8B/1B assisted
+  decoding loop that manually drafts candidates and verifies them without
+  calling Hugging Face `generate()`.
 - `tools/trace_huggingface_assisted_generation.py`: runs real HF greedy and
   assisted generation, then traces the assisted path.
 - `tools/locate_huggingface_generation_source.py`: prints local Transformers
   source paths and search terms.
 - `tools/compare_generation_outputs.py`: compares target greedy, HF assisted,
   and manual speculative outputs.
+- `tools/compare_hf_vs_stripped_assisted_steps.py`: runs HF assisted generation
+  and the stripped-down decoder, then compares their candidate/verification
+  steps side by side.
 - `tools/interactive_llama_speculative_session.py`: long-running Llama-oriented
   session that loads a larger target and smaller assistant once, then reuses
   them for many prompts.
@@ -261,7 +267,9 @@ python tools/locate_huggingface_generation_source.py
 python decoders/first_principles_speculative_decoder.py
 python decoders/simple_greedy_speculative_decoder.py
 python decoders/cache_aware_speculative_decoder.py
+python decoders/stripped_down_llama_assisted_decoder.py
 python tools/compare_generation_outputs.py
+python tools/compare_hf_vs_stripped_assisted_steps.py
 ```
 
 If your IDE uses Apple system Python and cannot import `torch`, run with the
