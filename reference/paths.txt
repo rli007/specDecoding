@@ -1,0 +1,11 @@
+GenerationMixin.generate:
+  /opt/anaconda3/lib/python3.13/site-packages/transformers/generation/utils.py:2130
+
+GenerationMixin._assisted_decoding:
+  /opt/anaconda3/lib/python3.13/site-packages/transformers/generation/utils.py:3425
+
+AssistedCandidateGenerator.get_candidates:
+  /opt/anaconda3/lib/python3.13/site-packages/transformers/generation/candidate_generator.py:200
+
+AssistedCandidateGenerator.update_candidate_strategy:
+  /opt/anaconda3/lib/python3.13/site-packages/transformers/generation/candidate_generator.py:225
