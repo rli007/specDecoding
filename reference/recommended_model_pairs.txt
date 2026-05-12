@@ -9,12 +9,12 @@ Llama 3 family
 
 Base continuation pair:
 
-target:    meta-llama/Meta-Llama-3-8B
+target:    meta-llama/Meta-Llama-3.1-8B
 assistant: meta-llama/Llama-3.2-1B
 
 Instruction/chat pair:
 
-target:    meta-llama/Meta-Llama-3-8B-Instruct
+target:    meta-llama/Meta-Llama-3.1-8B-Instruct
 assistant: meta-llama/Llama-3.2-1B-Instruct
 
 Notes:

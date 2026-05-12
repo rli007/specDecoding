@@ -25,7 +25,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-DEFAULT_TARGET_MODEL = "meta-llama/Meta-Llama-3-8B"
+DEFAULT_TARGET_MODEL = "meta-llama/Meta-Llama-3.1-8B"
 DEFAULT_ASSISTANT_MODEL = "meta-llama/Llama-3.2-1B"
 DEFAULT_PROMPT = "The Stanford football team"
 DEFAULT_MAX_NEW_TOKENS = 2

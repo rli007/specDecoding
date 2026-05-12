@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 from dataclasses import dataclass, field
+from datetime import datetime
+import logging
 from pathlib import Path
 import sys
 from typing import Any, Callable
@@ -22,7 +24,6 @@ if str(ROOT) not in sys.path:
 from decoders.stripped_down_llama_assisted_decoder import (  # noqa: E402
     AssistedStepTrace,
     DEFAULT_ASSISTANT_MODEL,
-    DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_NUM_ASSISTANT_TOKENS,
     DEFAULT_PROMPT,
     DEFAULT_TARGET_MODEL,
@@ -30,6 +31,19 @@ from decoders.stripped_down_llama_assisted_decoder import (  # noqa: E402
     choose_device,
     dtype_from_arg,
 )
+
+
+# Pick the normal test prompt here. You can add more named prompts below.
+DEFAULT_TEST_PROMPT_NAME = "story"
+DEFAULT_TEST_MAX_NEW_TOKENS = 16
+DEFAULT_TEST_NUM_ASSISTANT_TOKENS = 2
+
+TEST_PROMPTS = {
+    "stanford": DEFAULT_PROMPT,
+    "short": "The quick brown fox",
+    "story": "In a small workshop near the ocean, the engineer",
+    "code": "def fibonacci(n):",
+}
 
 
 @dataclass
@@ -43,6 +57,90 @@ class HfStepTrace:
     appended_tokens: list[int] = field(default_factory=list)
     next_assistant_budget: float | None = None
     output_length: int | None = None
+
+
+class TeeStream:
+    """Write output to both the original stream and the run log."""
+
+    def __init__(self, stream, log_file):
+        self.stream = stream
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        self.stream.write(text)
+        self.log_file.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
+def log_path_for_run(log_dir: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return log_dir / f"compare_hf_vs_stripped_assisted_steps_{timestamp}.txt"
+
+
+def current_logging_handlers() -> list[logging.Handler]:
+    handlers = list(logging.getLogger().handlers)
+    for logger in logging.Logger.manager.loggerDict.values():
+        if isinstance(logger, logging.Logger):
+            handlers.extend(logger.handlers)
+    return handlers
+
+
+@contextlib.contextmanager
+def tee_run_output(args: argparse.Namespace, prompt: str, device: torch.device):
+    if args.no_log:
+        yield None
+        return
+
+    log_dir = Path(args.log_dir).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_path_for_run(log_dir)
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        stdout_tee = TeeStream(original_stdout, log_file)
+        stderr_tee = TeeStream(original_stderr, log_file)
+        sys.stdout = stdout_tee
+        sys.stderr = stderr_tee
+        handler_streams: list[tuple[logging.StreamHandler, Any]] = []
+        for handler in current_logging_handlers():
+            if isinstance(handler, logging.StreamHandler) and handler.stream in {original_stdout, original_stderr}:
+                handler_streams.append((handler, handler.stream))
+                handler.setStream(stderr_tee if handler.stream is original_stderr else stdout_tee)
+        try:
+            print("RUN LOG")
+            print(f"started_at: {datetime.now().isoformat(timespec='seconds')}")
+            print(f"log_path: {log_path}")
+            print(f"command: {' '.join(sys.argv)}")
+            print(f"target_model: {args.target_model}")
+            print(f"assistant_model: {args.assistant_model}")
+            print(f"tokenizer_model: {args.tokenizer_model or args.target_model}")
+            print(f"prompt_name: {args.prompt_name}")
+            print(f"prompt: {prompt!r}")
+            print(f"max_new_tokens: {args.max_new_tokens}")
+            print(f"num_assistant_tokens: {args.num_assistant_tokens}")
+            print(f"device_arg: {args.device}")
+            print(f"selected_device: {device}")
+            print(f"dtype: {args.dtype}")
+            print(f"attn_implementation: {args.attn_implementation}")
+            print(f"low_cpu_mem_usage: {args.low_cpu_mem_usage}")
+            print()
+            yield log_path
+        finally:
+            for handler, stream in handler_streams:
+                handler.setStream(stream)
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 @contextlib.contextmanager
@@ -107,13 +205,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-model", default=DEFAULT_TARGET_MODEL)
     parser.add_argument("--assistant-model", default=DEFAULT_ASSISTANT_MODEL)
     parser.add_argument("--tokenizer-model", default=None, help="Tokenizer to use. Defaults to --target-model.")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
-    parser.add_argument("--num-assistant-tokens", type=int, default=DEFAULT_NUM_ASSISTANT_TOKENS)
+    parser.add_argument("--prompt-name", default=DEFAULT_TEST_PROMPT_NAME, choices=sorted(TEST_PROMPTS))
+    parser.add_argument("--prompt", default=None, help="Literal prompt override. If set, ignores --prompt-name.")
+    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_TEST_MAX_NEW_TOKENS)
+    parser.add_argument("--num-assistant-tokens", type=int, default=DEFAULT_TEST_NUM_ASSISTANT_TOKENS)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default=None)
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32", "none"), default="float16")
     parser.add_argument("--attn-implementation", default=None, help="Optional HF attention implementation, for example sdpa.")
     parser.add_argument("--low-cpu-mem-usage", action="store_true")
+    parser.add_argument("--log-dir", default=str(ROOT / "run_logs"), help="Directory for timestamped text logs.")
+    parser.add_argument("--no-log", action="store_true", help="Disable tee logging for this run.")
     return parser.parse_args()
 
 
@@ -133,6 +234,30 @@ def configure_assistant_for_comparison(assistant: torch.nn.Module, num_assistant
     assistant.generation_config.num_assistant_tokens = num_assistant_tokens
     assistant.generation_config.num_assistant_tokens_schedule = "heuristic"
     assistant.generation_config.assistant_confidence_threshold = 0.0
+
+
+def model_vocab_size(model: torch.nn.Module) -> int | None:
+    output_embeddings = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+    if output_embeddings is not None and hasattr(output_embeddings, "weight"):
+        return int(output_embeddings.weight.shape[0])
+    config = getattr(model, "config", None)
+    vocab_size = getattr(config, "vocab_size", None)
+    return int(vocab_size) if vocab_size is not None else None
+
+
+def validate_same_vocab(target: torch.nn.Module, assistant: torch.nn.Module) -> None:
+    target_vocab_size = model_vocab_size(target)
+    assistant_vocab_size = model_vocab_size(assistant)
+    if target_vocab_size is None or assistant_vocab_size is None:
+        print("vocab size check: skipped")
+        return
+    print(f"vocab size check: target={target_vocab_size}, assistant={assistant_vocab_size}")
+    if target_vocab_size != assistant_vocab_size:
+        raise ValueError(
+            "Target and assistant vocab sizes differ "
+            f"({target_vocab_size} vs {assistant_vocab_size}). "
+            "This comparison harness assumes a shared tokenizer/vocab."
+        )
 
 
 def decode_token_list(tokenizer: AutoTokenizer, token_ids: list[int]) -> str:
@@ -201,15 +326,30 @@ def print_step_pair(
         )
 
 
-def main() -> None:
-    args = parse_args()
-    device = choose_device(args.device)
+def print_step_count_note(args: argparse.Namespace, hf_steps: list[HfStepTrace], our_steps: list[AssistedStepTrace]) -> None:
+    step_count = max(len(hf_steps), len(our_steps))
+    if step_count > 1:
+        return
+
+    max_one_step_append = args.num_assistant_tokens + 1
+    print("\nSTEP COUNT NOTE")
+    print(
+        "Only one assisted step was captured. That can be completely normal: "
+        f"one step can append up to num_assistant_tokens + 1 = {max_one_step_append} tokens, "
+        f"and this run requested max_new_tokens={args.max_new_tokens}."
+    )
+    print("To force more steps, increase --max-new-tokens or lower --num-assistant-tokens.")
+
+
+def run_comparison(args: argparse.Namespace, prompt: str, device: torch.device) -> None:
     tokenizer_name = args.tokenizer_model or args.target_model
     model_kwargs = make_model_kwargs(args)
-
     print(f"Using device={device}")
     print(f"target model: {args.target_model}")
     print(f"assistant model: {args.assistant_model}")
+    print(f"prompt: {prompt!r}")
+    print(f"max_new_tokens: {args.max_new_tokens}")
+    print(f"initial num_assistant_tokens: {args.num_assistant_tokens}")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
@@ -217,7 +357,9 @@ def main() -> None:
 
     target = AutoModelForCausalLM.from_pretrained(args.target_model, **model_kwargs).to(device).eval()
     assistant = AutoModelForCausalLM.from_pretrained(args.assistant_model, **model_kwargs).to(device).eval()
-    inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
+    validate_same_vocab(target, assistant)
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    print(f"prompt token length: {inputs.input_ids.shape[-1]}")
 
     configure_assistant_for_comparison(assistant, args.num_assistant_tokens)
     hf_steps: list[HfStepTrace] = []
@@ -253,10 +395,22 @@ def main() -> None:
     print(f"OURS text: {tokenizer.decode(our_output[0], skip_special_tokens=True)!r}")
 
     print("\nSTEP COMPARISON")
+    print_step_count_note(args, hf_steps, our_steps)
     for index in range(max(len(hf_steps), len(our_steps))):
         hf_step = hf_steps[index] if index < len(hf_steps) else None
         our_step = our_steps[index] if index < len(our_steps) else None
         print_step_pair(tokenizer, hf_step, our_step)
+
+
+def main() -> None:
+    args = parse_args()
+    device = choose_device(args.device)
+    prompt = args.prompt if args.prompt is not None else TEST_PROMPTS[args.prompt_name]
+
+    with tee_run_output(args, prompt, device) as log_path:
+        run_comparison(args, prompt, device)
+        if log_path is not None:
+            print(f"\nLog written to: {log_path}")
 
 
 if __name__ == "__main__":

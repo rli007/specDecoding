@@ -47,11 +47,10 @@ KV cache / model kwargs are updated
 repeat
 ```
 
-`tools/trace_huggingface_assisted_generation.py` monkey-patches the local Transformers install where
-possible and prints calls through `GenerationMixin.generate`,
-`get_generation_mode`, `_assisted_decoding`,
-`AssistedCandidateGenerator.get_candidates`, assistant forwards, and target
-forwards.
+`tools/compare_hf_vs_stripped_assisted_steps.py` runs Hugging Face assisted
+generation and the stripped-down local decoder with the same models, then prints
+their candidate, target-verification, acceptance, and append decisions side by
+side.
 
 ## Manual Speculative Decoding Algorithm
 
@@ -153,7 +152,7 @@ python tools/interactive_llama_speculative_session.py
 By default it uses:
 
 ```text
-target:    meta-llama/Meta-Llama-3-8B
+target:    meta-llama/Meta-Llama-3.1-8B
 assistant: meta-llama/Llama-3.2-1B
 ```
 
@@ -162,7 +161,7 @@ instruction-tuned pair:
 
 ```bash
 python tools/interactive_llama_speculative_session.py \
-  --target-model meta-llama/Meta-Llama-3-8B-Instruct \
+  --target-model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --assistant-model meta-llama/Llama-3.2-1B-Instruct
 ```
 
@@ -223,22 +222,13 @@ prompt -> prefill -> assistant draft -> target verify -> accept/reject -> update
 
 ## Files
 
+Active path:
+
 - `decoders/first_principles_speculative_decoder.py`: isolated tensor-level
   speculative decoder with structured per-step tracing.
-- `decoders/simple_greedy_speculative_decoder.py`: clear manual speculative
-  decoding, including the earlier verbose tokenizer/prompt-oriented demo.
-- `decoders/cache_aware_speculative_decoder.py`: cached-style version that
-  exposes prefill, decode, `past_key_values`, `cache_position`, and cache
-  rebuilds.
 - `decoders/stripped_down_llama_assisted_decoder.py`: Llama 8B/1B assisted
   decoding loop that manually drafts candidates and verifies them without
   calling Hugging Face `generate()`.
-- `tools/trace_huggingface_assisted_generation.py`: runs real HF greedy and
-  assisted generation, then traces the assisted path.
-- `tools/locate_huggingface_generation_source.py`: prints local Transformers
-  source paths and search terms.
-- `tools/compare_generation_outputs.py`: compares target greedy, HF assisted,
-  and manual speculative outputs.
 - `tools/compare_hf_vs_stripped_assisted_steps.py`: runs HF assisted generation
   and the stripped-down decoder, then compares their candidate/verification
   steps side by side.
@@ -248,8 +238,21 @@ prompt -> prefill -> assistant draft -> target verify -> accept/reject -> update
 - `reference/recommended_model_pairs.txt`: compatible target/assistant pairs.
 - `reference/static_cache_generation_reference.txt`: reference static-cache
   generation example this repo mirrors.
-- `reference/sample_speculative_trace.txt`: saved trace output from an example
-  speculative decoding run.
+- `reference/candidate_generation.txt`: Hugging Face candidate-generator
+  excerpts.
+- `reference/relevant_portions.txt`: Hugging Face `_assisted_decoding`
+  excerpts.
+- `run_logs/`: timestamped outputs from comparison runs.
+
+Archived experiments:
+
+- `archive/decoders/simple_greedy_speculative_decoder.py`
+- `archive/decoders/cache_aware_speculative_decoder.py`
+- `archive/tools/trace_huggingface_assisted_generation.py`
+- `archive/tools/locate_huggingface_generation_source.py`
+- `archive/tools/compare_generation_outputs.py`
+- `archive/tools/assisted_generation_scratchpad.py`
+- `archive/reference/sample_speculative_trace.txt`
 
 ## How To Run
 
@@ -262,13 +265,8 @@ pip install -r requirements.txt
 Run:
 
 ```bash
-python tools/trace_huggingface_assisted_generation.py
-python tools/locate_huggingface_generation_source.py
 python decoders/first_principles_speculative_decoder.py
-python decoders/simple_greedy_speculative_decoder.py
-python decoders/cache_aware_speculative_decoder.py
 python decoders/stripped_down_llama_assisted_decoder.py
-python tools/compare_generation_outputs.py
 python tools/compare_hf_vs_stripped_assisted_steps.py
 ```
 
@@ -276,7 +274,7 @@ If your IDE uses Apple system Python and cannot import `torch`, run with the
 Anaconda interpreter:
 
 ```bash
-/opt/anaconda3/bin/python tools/trace_huggingface_assisted_generation.py
+/opt/anaconda3/bin/python tools/compare_hf_vs_stripped_assisted_steps.py
 ```
 
 ## Expected Result
@@ -286,8 +284,8 @@ For greedy decoding:
 - normal target generation should match HF assisted generation
 - manual speculative decoding should match normal target generation
 
-`tools/compare_generation_outputs.py` prints decoded outputs, token IDs, equality checks, and the
-first mismatch if something diverges.
+`tools/compare_hf_vs_stripped_assisted_steps.py` prints decoded outputs, token
+IDs, equality checks, and each HF/custom assisted-decoding step side by side.
 
 ## Known Limitations
 
