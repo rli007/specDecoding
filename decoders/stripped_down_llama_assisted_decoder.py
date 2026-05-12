@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import math
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -47,8 +47,26 @@ class CandidateDraft:
 
 
 @dataclass
+class TokenProbability:
+    token_id: int
+    probability: float
+
+
+@dataclass
+class SamplingDecision:
+    index: int
+    candidate_token: int
+    assistant_probability: float
+    target_probability: float
+    acceptance_ratio: float
+    random_value: float
+    accepted: bool
+
+
+@dataclass
 class AssistedStepTrace:
     step: int
+    mode: str
     prefix_length: int
     assistant_budget: int
     draft_tokens: list[int]
@@ -57,6 +75,9 @@ class AssistedStepTrace:
     appended_tokens: list[int]
     next_assistant_budget: float
     output_length: int
+    assistant_top_probs: list[list[TokenProbability]]
+    target_top_probs: list[list[TokenProbability]]
+    sampling_decisions: list[SamplingDecision]
 
 
 def choose_device(device_arg: str | None) -> torch.device:
@@ -134,6 +155,47 @@ def select_next_token(
     return torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
 
 
+def sample_next_token(
+    logits: torch.Tensor,
+    eos_token_ids: set[int],
+    current_length: int,
+    min_length: int,
+) -> torch.Tensor:
+    if current_length < min_length - 1:
+        logits = process_logits(logits, eos_token_ids)
+    probabilities = torch.softmax(logits[:, -1, :], dim=-1)
+    return torch.multinomial(probabilities, num_samples=1)
+
+
+def choose_next_token(
+    logits: torch.Tensor,
+    eos_token_ids: set[int],
+    current_length: int,
+    min_length: int,
+    do_sample: bool,
+) -> torch.Tensor:
+    if do_sample:
+        return sample_next_token(logits, eos_token_ids, current_length, min_length)
+    return select_next_token(logits, eos_token_ids, current_length, min_length)
+
+
+def summarize_top_probs(logits: torch.Tensor | None, top_k: int) -> list[list[TokenProbability]]:
+    if logits is None or top_k <= 0:
+        return []
+    probabilities = torch.softmax(logits.detach().float(), dim=-1)
+    top_k = min(top_k, probabilities.shape[-1])
+    values, token_ids = torch.topk(probabilities[0], k=top_k, dim=-1)
+    summaries: list[list[TokenProbability]] = []
+    for position in range(values.shape[0]):
+        summaries.append(
+            [
+                TokenProbability(token_id=int(token_id), probability=float(probability))
+                for token_id, probability in zip(token_ids[position].cpu().tolist(), values[position].cpu().tolist())
+            ]
+        )
+    return summaries
+
+
 def token_is_eos(token: torch.Tensor, eos_token_ids: set[int]) -> bool:
     return bool(eos_token_ids) and int(token.item()) in eos_token_ids
 
@@ -160,8 +222,9 @@ def assistant_draft_candidates(
     num_candidate_tokens: int,
     eos_token_ids: set[int],
     min_length: int,
+    do_sample: bool = False,
 ) -> CandidateDraft:
-    """Draft greedy candidate tokens with manual assistant forwards."""
+    """Draft candidate tokens with manual assistant forwards."""
     if num_candidate_tokens <= 0:
         empty = torch.empty((input_ids.shape[0], 0), dtype=input_ids.dtype, device=input_ids.device)
         return CandidateDraft(tokens=empty, logits=None, ended_on_eos=False)
@@ -180,7 +243,7 @@ def assistant_draft_candidates(
         # First call pre-fills the assistant cache with the current sequence.
         # Later calls feed one draft token and reuse that cache.
         logits, past_key_values = model_forward(assistant_model, next_input_ids, past_key_values)
-        next_token = select_next_token(logits, eos_token_ids, current_length, min_length)
+        next_token = choose_next_token(logits, eos_token_ids, current_length, min_length, do_sample)
 
         draft_logits.append(logits[:, -1, :].detach())
         draft_tokens.append(next_token)
@@ -250,6 +313,63 @@ def count_matching_prefix(candidate_tokens: torch.Tensor, selected_tokens: torch
     return int(mismatches[0].nonzero(as_tuple=False)[0].item())
 
 
+def speculative_sampling_acceptance(
+    candidate_tokens: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    ended_on_eos: bool,
+) -> tuple[torch.Tensor, int, list[SamplingDecision]]:
+    """Apply HF's speculative sampling acceptance rule."""
+    candidate_length = candidate_tokens.shape[-1]
+    if candidate_length == 0:
+        probabilities = torch.softmax(target_logits[:, 0, :].float(), dim=-1)
+        sampled_token = torch.multinomial(probabilities, num_samples=1)
+        return sampled_token, 0, []
+
+    q = torch.softmax(candidate_logits.float(), dim=-1)
+    p = torch.softmax(target_logits.float(), dim=-1)
+    candidate_positions = torch.arange(candidate_length, device=candidate_tokens.device)
+    q_i = q[0, candidate_positions, candidate_tokens[0]]
+    p_i = p[0, candidate_positions, candidate_tokens[0]]
+    probability_ratio = p_i / q_i
+
+    random_values = torch.rand_like(probability_ratio)
+    accepted_mask = random_values <= probability_ratio
+    n_matches = int(((~accepted_mask).cumsum(dim=-1) < 1).sum().item())
+
+    decisions = [
+        SamplingDecision(
+            index=index,
+            candidate_token=int(candidate_tokens[0, index].item()),
+            assistant_probability=float(q_i[index].item()),
+            target_probability=float(p_i[index].item()),
+            acceptance_ratio=float(probability_ratio[index].item()),
+            random_value=float(random_values[index].item()),
+            accepted=bool(accepted_mask[index].item()),
+        )
+        for index in range(candidate_length)
+    ]
+
+    if ended_on_eos and n_matches == candidate_length:
+        n_matches -= 1
+        valid_tokens = candidate_tokens[:, : n_matches + 1]
+    else:
+        p_next = p[:, n_matches, :]
+        if n_matches < candidate_length:
+            q_next = q[:, n_matches, :]
+            p_prime = torch.clamp(p_next - q_next, min=0)
+            p_prime = p_prime / p_prime.sum(dim=-1, keepdim=True)
+        else:
+            p_prime = p_next
+        sampled_token = torch.multinomial(p_prime, num_samples=1)
+        if n_matches > 0:
+            valid_tokens = torch.cat([candidate_tokens[:, :n_matches], sampled_token], dim=-1)
+        else:
+            valid_tokens = sampled_token
+
+    return valid_tokens, n_matches, decisions
+
+
 def update_candidate_strategy(state: CandidateState, candidate_length: int, n_matches: int) -> None:
     """HF heuristic schedule: increase on full match, decrease on mismatch."""
     if n_matches == candidate_length:
@@ -266,14 +386,19 @@ def assisted_generate(
     min_length: int = 0,
     eos_token_id: int | Iterable[int] | torch.Tensor | None = None,
     num_assistant_tokens: int = DEFAULT_NUM_ASSISTANT_TOKENS,
+    mode: str = "greedy",
+    top_k_probs: int = 0,
     verbose: bool = True,
     trace_steps: list[AssistedStepTrace] | None = None,
+    step_callback: Callable[[AssistedStepTrace], None] | None = None,
 ) -> torch.Tensor:
-    """Greedy assisted decoding with manual candidate generation."""
+    """Assisted decoding with manual candidate generation."""
     if prompt_token_ids.ndim != 2 or prompt_token_ids.shape[0] != 1:
         raise ValueError("This stripped decoder expects input IDs with shape [1, sequence_length].")
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative.")
+    if mode not in {"greedy", "sampling"}:
+        raise ValueError("mode must be 'greedy' or 'sampling'.")
     if max_new_tokens == 0:
         return prompt_token_ids
 
@@ -282,6 +407,7 @@ def assisted_generate(
     prompt_length = generated.shape[-1]
     eos_token_ids = normalize_eos_token_ids(eos_token_id)
     candidate_state = CandidateState(num_assistant_tokens=float(num_assistant_tokens))
+    do_sample = mode == "sampling"
 
     with torch.no_grad():
         step = 1
@@ -304,6 +430,7 @@ def assisted_generate(
                 candidate_count,
                 eos_token_ids,
                 min_length,
+                do_sample=do_sample,
             )
 
             # Assisted decoding: target verifies the candidate block plus one
@@ -317,37 +444,52 @@ def assisted_generate(
             )
 
             candidate_length = draft.tokens.shape[-1]
-            n_matches = count_matching_prefix(draft.tokens, selected_tokens)
+            sampling_decisions: list[SamplingDecision] = []
+            if do_sample:
+                valid_tokens, n_matches, sampling_decisions = speculative_sampling_acceptance(
+                    draft.tokens,
+                    draft.logits,
+                    target_logits,
+                    draft.ended_on_eos,
+                )
+            else:
+                n_matches = count_matching_prefix(draft.tokens, selected_tokens)
 
-            # If the candidate sequence itself reached a stop condition, do not
-            # append the extra target bonus token after the final candidate.
-            if draft.ended_on_eos and n_matches == candidate_length:
-                n_matches -= 1
+                # If the candidate sequence itself reached a stop condition, do not
+                # append the extra target bonus token after the final candidate.
+                if draft.ended_on_eos and n_matches == candidate_length:
+                    n_matches -= 1
 
-            valid_tokens = selected_tokens[:, : n_matches + 1]
+                valid_tokens = selected_tokens[:, : n_matches + 1]
             remaining = max_new_tokens - (generated.shape[-1] - prompt_length)
             valid_tokens = valid_tokens[:, :remaining]
             generated = torch.cat([generated, valid_tokens.to(generated.device)], dim=-1)
 
             update_candidate_strategy(candidate_state, candidate_length, n_matches)
+            step_trace = AssistedStepTrace(
+                step=step,
+                mode=mode,
+                prefix_length=current_length,
+                assistant_budget=candidate_count,
+                draft_tokens=draft.tokens[0].tolist(),
+                target_selected_tokens=selected_tokens[0].tolist(),
+                accepted_assistant_tokens=n_matches,
+                appended_tokens=valid_tokens[0].tolist(),
+                next_assistant_budget=candidate_state.num_assistant_tokens,
+                output_length=generated.shape[-1],
+                assistant_top_probs=summarize_top_probs(draft.logits, top_k_probs),
+                target_top_probs=summarize_top_probs(target_logits, top_k_probs),
+                sampling_decisions=sampling_decisions,
+            )
 
             if trace_steps is not None:
-                trace_steps.append(
-                    AssistedStepTrace(
-                        step=step,
-                        prefix_length=current_length,
-                        assistant_budget=candidate_count,
-                        draft_tokens=draft.tokens[0].tolist(),
-                        target_selected_tokens=selected_tokens[0].tolist(),
-                        accepted_assistant_tokens=n_matches,
-                        appended_tokens=valid_tokens[0].tolist(),
-                        next_assistant_budget=candidate_state.num_assistant_tokens,
-                        output_length=generated.shape[-1],
-                    )
-                )
+                trace_steps.append(step_trace)
+            if step_callback is not None:
+                step_callback(step_trace)
 
             if verbose:
                 print(f"\nASSISTED STEP {step}")
+                print(f"mode: {mode}")
                 print(f"prefix length: {current_length}")
                 print(f"assistant token budget: {candidate_count}")
                 print(f"assistant draft tokens: {draft.tokens[0].tolist()}")
@@ -373,6 +515,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--num-assistant-tokens", type=int, default=DEFAULT_NUM_ASSISTANT_TOKENS)
+    parser.add_argument("--mode", choices=("greedy", "sampling"), default="greedy")
+    parser.add_argument("--top-k-probs", type=int, default=0)
     parser.add_argument("--min-length", type=int, default=0)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default=None)
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32", "none"), default="float16")
@@ -416,6 +560,8 @@ def main() -> None:
         min_length=args.min_length,
         eos_token_id=tokenizer.eos_token_id,
         num_assistant_tokens=args.num_assistant_tokens,
+        mode=args.mode,
+        top_k_probs=args.top_k_probs,
         verbose=not args.quiet,
     )
 

@@ -270,6 +270,14 @@ python decoders/stripped_down_llama_assisted_decoder.py
 python tools/compare_hf_vs_stripped_assisted_steps.py
 ```
 
+Useful comparison flags:
+
+```bash
+python tools/compare_hf_vs_stripped_assisted_steps.py --mode greedy
+python tools/compare_hf_vs_stripped_assisted_steps.py --mode sampling --top-k-probs 5 --seed 1234
+python tools/compare_hf_vs_stripped_assisted_steps.py --no-live-steps
+```
+
 If your IDE uses Apple system Python and cannot import `torch`, run with the
 Anaconda interpreter:
 
