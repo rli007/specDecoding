@@ -53,6 +53,21 @@ model forwards. It does not call HF `generate()` inside the local decoder.
 - `decoders/first_principles_speculative_decoder.py`  
   Older but still useful tensor-level decoder with structured tracing.
 
+- `decoders/ngram_speculative_decoder.py`  
+  First-principles prompt-lookup / n-gram speculative decoder. This one needs no
+  assistant model; it copies continuations from repeated n-grams in the existing
+  context and verifies them with target forwards.
+
+- `decoders/medusa_speculative_decoder.py`  
+  Medusa-style decoder with inspectable Medusa-head candidate construction and a
+  slow path verifier. It does not call HF `generate()`, but useful behavior
+  requires trained Medusa heads.
+
+- `decoders/eagle_speculative_decoder.py`  
+  EAGLE-style hidden-state drafter loop with a pluggable `propose_tree(...)`
+  interface. Exact EAGLE/EAGLE3 behavior requires trained EAGLE draft weights
+  paired with the target model.
+
 - `tools/interactive_llama_speculative_session.py`  
   Interactive Llama session that loads the models once and reuses them across
   prompts.
@@ -181,6 +196,42 @@ python tools/compare_hf_vs_stripped_assisted_steps.py \
   --dtype none
 ```
 
+## Extra Algorithm Decoders
+
+The newer algorithm files separate the proposal strategy from target
+verification:
+
+```text
+ngram:  repeated suffix in context -> copied continuation -> target verifies
+Medusa: target hidden state -> Medusa heads -> candidate tree -> target verifies
+EAGLE:  target hidden state -> trained EAGLE drafter -> candidate tree -> target verifies
+```
+
+Run the tiny no-download smoke test:
+
+```bash
+python tools/smoke_algorithm_decoders.py
+```
+
+Run n-gram prompt lookup with a real model:
+
+```bash
+python decoders/ngram_speculative_decoder.py \
+  --target-model gpt2 \
+  --prompt "The future of AI is the future of" \
+  --max-new-tokens 20 \
+  --num-speculative-tokens 4 \
+  --max-matching-ngram-size 4 \
+  --progress
+```
+
+Medusa and EAGLE are implemented as first-principles loops, but they are not
+weight loaders. For Medusa, pass a module that maps target hidden states to
+`[num_heads, batch, seq, vocab]` Medusa logits. For EAGLE, pass a drafter object
+with `propose_tree(input_ids, hidden_states, target_logits, max_depth, top_k,
+max_paths)` returning candidate token paths. This keeps the algorithm readable
+and avoids hiding the important work inside a framework `generate()` call.
+
 ## Current Limitations
 
 - Batch size is 1.
@@ -191,3 +242,5 @@ python tools/compare_hf_vs_stripped_assisted_steps.py \
   of scope.
 - Sampling can branch from HF because exact sampling RNG/numerics are hard to
   reproduce across implementation paths.
+- Medusa and EAGLE use slow per-path verification for inspectability instead of
+  optimized tree attention.
