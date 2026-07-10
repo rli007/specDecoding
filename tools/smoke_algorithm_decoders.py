@@ -19,6 +19,23 @@ from decoders import medusa_speculative_decoder as medusa
 from decoders import ngram_speculative_decoder as ngram
 
 
+class ToyCacheLayer:
+    is_sliding = False
+
+    def __init__(self):
+        self.keys = torch.empty((1, 1, 0, 1))
+        self.values = torch.empty((1, 1, 0, 1))
+
+
+class ToyCache:
+    def __init__(self):
+        self.layers = [ToyCacheLayer()]
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        del layer_idx
+        return self.layers[0].keys.shape[-2]
+
+
 class IncrementToyLM(nn.Module):
     """A tiny causal LM where every token predicts `(token + 1) % vocab`."""
 
@@ -30,8 +47,17 @@ class IncrementToyLM(nn.Module):
         self.config = SimpleNamespace(vocab_size=vocab_size)
         self.generation_config = SimpleNamespace(eos_token_id=None)
 
-    def forward(self, input_ids, output_hidden_states=False, use_cache=False, **kwargs):
-        del use_cache, kwargs
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        output_hidden_states=False,
+        use_cache=False,
+        **kwargs,
+    ):
+        del attention_mask, position_ids, kwargs
         batch_size, sequence_length = input_ids.shape
         logits = torch.full(
             (batch_size, sequence_length, self.vocab_size),
@@ -47,9 +73,17 @@ class IncrementToyLM(nn.Module):
             device=input_ids.device,
         )
         hidden_states[..., 0] = input_ids.float()
+        if use_cache:
+            if past_key_values is None:
+                past_key_values = ToyCache()
+            keys = input_ids.float().reshape(batch_size, 1, sequence_length, 1)
+            values = keys.clone()
+            layer = past_key_values.layers[0]
+            layer.keys = torch.cat([layer.keys.to(keys.device), keys], dim=-2)
+            layer.values = torch.cat([layer.values.to(values.device), values], dim=-2)
         if output_hidden_states:
-            return SimpleNamespace(logits=logits, hidden_states=(hidden_states,))
-        return SimpleNamespace(logits=logits)
+            return SimpleNamespace(logits=logits, hidden_states=(hidden_states,), past_key_values=past_key_values)
+        return SimpleNamespace(logits=logits, past_key_values=past_key_values)
 
 
 class IncrementMedusaHeads(nn.Module):
@@ -106,9 +140,23 @@ def main() -> None:
         prompt,
         max_new_tokens=3,
         top_k=1,
+        verifier="slow",
     )
     assert_ids("medusa", medusa_output, expected)
     assert medusa_trace[0].selected_path_tokens == [3, 4, 5]
+
+    medusa_tree_output, medusa_tree_trace = medusa.generate_with_trace(
+        model,
+        medusa_heads,
+        prompt,
+        max_new_tokens=3,
+        top_k=1,
+        verifier="tree",
+        fallback_to_slow=False,
+    )
+    assert_ids("medusa-tree", medusa_tree_output, expected)
+    assert medusa_tree_trace[0].verification_method == "tree"
+    assert medusa_tree_trace[0].cache_updated is True
 
     eagle_output, eagle_trace = eagle.generate_with_trace(
         model,

@@ -27,6 +27,7 @@ from decoders.medusa_speculative_decoder import (
     load_official_medusa_heads,
     print_trace,
     linear_medusa_choices,
+    official_medusa_choices,
     small_medusa_tree_choices,
 )
 
@@ -57,20 +58,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-low-cpu-mem-usage", action="store_false", dest="low_cpu_mem_usage")
     parser.add_argument("--medusa-num-heads", type=int, default=None, help="Override head count if checkpoint config is missing.")
     parser.add_argument("--medusa-num-layers", type=int, default=None, help="Override residual layers per head if config is missing.")
-    parser.add_argument("--top-k", type=int, default=1, help="Top-k Medusa choices per head used by candidate buffers.")
+    parser.add_argument("--top-k", type=int, default=10, help="Top-k Medusa choices per head used by candidate buffers.")
     parser.add_argument(
         "--choice-preset",
-        choices=("linear", "small-tree"),
-        default="linear",
-        help="linear is fastest; small-tree verifies several candidate paths for easier tree inspection.",
+        choices=("linear", "small-tree", "official-vicuna-7b", "official-vicuna-13b", "official-zephyr"),
+        default="official-vicuna-7b",
+        help="Official presets are sparse Medusa trees; linear is the smallest debugging path.",
     )
+    parser.add_argument("--verifier", choices=("tree", "slow"), default="tree")
+    parser.add_argument("--acceptance", choices=("greedy", "typical", "nucleus"), default="greedy")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--posterior-threshold", type=float, default=0.09)
+    parser.add_argument("--posterior-alpha", type=float, default=0.3)
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--no-kv-cache", action="store_false", dest="use_kv_cache")
+    parser.add_argument("--slow-fallback", action="store_true", dest="fallback_to_slow")
     parser.add_argument("--show-logits", action="store_true")
     parser.add_argument("--top-k-logits", type=int, default=5)
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--no-step-text", action="store_false", dest="step_text", help="Disable per-step partial text prints.")
     parser.add_argument("--output-txt", default=None, help="Optional text file for final output and step trace.")
     parser.add_argument("--heartbeat-seconds", type=float, default=5.0)
-    parser.set_defaults(low_cpu_mem_usage=True, step_text=True)
+    parser.set_defaults(low_cpu_mem_usage=True, step_text=True, use_kv_cache=True, fallback_to_slow=False)
     return parser.parse_args()
 
 
@@ -89,6 +98,8 @@ def model_kwargs_from_args(args: argparse.Namespace) -> dict:
 def medusa_choices_for(args: argparse.Namespace, num_heads: int):
     if args.choice_preset == "small-tree":
         return small_medusa_tree_choices(num_heads, args.top_k)
+    if args.choice_preset.startswith("official-"):
+        return official_medusa_choices(args.choice_preset, num_heads, args.top_k)
     return linear_medusa_choices(num_heads)
 
 
@@ -118,6 +129,7 @@ def main() -> None:
     print(f"dtype: {args.dtype}")
     print(f"max_new_tokens: {max_new_tokens}")
     print(f"choice preset: {args.choice_preset}, top_k={args.top_k}")
+    print(f"verifier: {args.verifier}, acceptance={args.acceptance}, use_kv_cache={args.use_kv_cache}")
     print_hardware_status(device)
     if device.type == "cpu":
         print("Note: CPU-only Vicuna 7B inference will be very slow.")
@@ -205,6 +217,14 @@ def main() -> None:
                 progress=args.progress,
                 heartbeat_seconds=args.heartbeat_seconds,
                 step_callback=on_step,
+                verifier=args.verifier,
+                acceptance_mode=args.acceptance,
+                temperature=args.temperature,
+                posterior_threshold=args.posterior_threshold,
+                posterior_alpha=args.posterior_alpha,
+                top_p=args.top_p,
+                use_kv_cache=args.use_kv_cache,
+                fallback_to_slow=args.fallback_to_slow,
             )
 
         print(f"\nGeneration finished after {len(trace_steps)} Medusa step(s).")

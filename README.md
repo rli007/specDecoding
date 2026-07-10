@@ -242,14 +242,32 @@ python tools/run_local_medusa.py \
   --max-new-tokens 1 \
   --device mps \
   --dtype float16 \
+  --attn-implementation eager \
   --progress
 ```
 
 That command still loads a 7B Vicuna base model plus the Medusa heads. The
-default `--choice-preset linear --top-k 1` verifies one Medusa path and is the
-best first local smoke test. After that works, try `--choice-preset small-tree
---top-k 2` to inspect branching behavior; it will be slower because this repo
-verifies paths one at a time instead of using optimized Medusa tree attention.
+default Medusa path now follows the paper mechanics more closely:
+`--choice-preset official-vicuna-7b --top-k 10 --verifier tree`, using one
+tree-attention target forward and selected KV-cache copying when the model/cache
+layout supports it. `--attn-implementation eager` is the most transparent
+setting for custom 4D tree masks.
+
+For the old inspectable reference path, use:
+
+```bash
+python tools/run_local_medusa.py \
+  --base-model lmsys/vicuna-7b-v1.3 \
+  --medusa-heads FasterDecoding/medusa-vicuna-7b-v1.3 \
+  --prompt "The professor asked for" \
+  --max-new-tokens 1 \
+  --choice-preset linear \
+  --top-k 1 \
+  --verifier slow \
+  --device mps \
+  --dtype float16 \
+  --progress
+```
 
 For a longer Medusa-paper-style sequence, keep the fast linear path and log the
 partial text after every accepted continuation:
@@ -262,13 +280,15 @@ python tools/run_local_medusa.py \
   --longer-sentence \
   --device mps \
   --dtype float16 \
+  --attn-implementation eager \
   --progress \
   --output-txt run_logs/medusa_longer_sentence.txt
 ```
 
-`--longer-sentence` currently means 12 new tokens. This is still slower than
-the paper's implementation because the repo intentionally uses ordinary target
-forwards to verify candidate paths instead of Medusa's optimized tree attention.
+`--longer-sentence` currently means 12 new tokens. If tree verification fails
+on a model/backend, the command errors by default instead of silently launching
+dozens of slow reference forwards. Add `--slow-fallback` only when using a tiny
+tree such as `--choice-preset linear --top-k 1`.
 
 Run a tiny MT-Bench-style Medusa generation pass:
 
@@ -279,6 +299,7 @@ python tools/run_medusa_mtbench.py \
   --max-new-tokens 16 \
   --device mps \
   --dtype float16 \
+  --attn-implementation eager \
   --progress
 ```
 
