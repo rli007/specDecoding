@@ -13,15 +13,19 @@ class below is the architecture shell; random heads are only good for tracing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from decoders.first_principles_speculative_decoder import (
     LogitTopK,
     decision_logits,
+    format_top_logits,
     model_device,
+    model_vocab_size,
     normalize_eos_token_ids,
     should_stop,
     stop_reason_for,
@@ -116,6 +120,153 @@ class MedusaHeadStack(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return torch.stack([head(hidden_states) for head in self.heads], dim=0)
+
+
+def _load_pretrained_config(path_or_repo_id: str) -> PretrainedConfig:
+    return PretrainedConfig.from_pretrained(path_or_repo_id)
+
+
+def infer_medusa_head_shape(
+    target_model: torch.nn.Module,
+    medusa_heads_path: str,
+    medusa_num_heads: int | None = None,
+    medusa_num_layers: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Infer `(hidden_size, vocab_size, num_heads, num_layers)` for Medusa heads."""
+    config = getattr(target_model, "config", None)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is None:
+        output_embeddings = target_model.get_output_embeddings()
+        hidden_size = output_embeddings.weight.shape[-1]
+    vocab_size = model_vocab_size(target_model)
+    if vocab_size is None:
+        raise ValueError("Could not infer target model vocabulary size.")
+
+    try:
+        medusa_config = _load_pretrained_config(medusa_heads_path)
+    except Exception:
+        medusa_config = None
+
+    num_heads = medusa_num_heads
+    if num_heads is None and medusa_config is not None:
+        num_heads = getattr(medusa_config, "medusa_num_heads", None)
+    if num_heads is None:
+        num_heads = 5
+
+    num_layers = medusa_num_layers
+    if num_layers is None and medusa_config is not None:
+        num_layers = getattr(medusa_config, "medusa_num_layers", None)
+    if num_layers is None:
+        num_layers = 1
+
+    return int(hidden_size), int(vocab_size), int(num_heads), int(num_layers)
+
+
+def _resolve_medusa_head_file(path_or_repo_id: str, filename: str = "medusa_lm_head.pt") -> str:
+    path = Path(path_or_repo_id).expanduser()
+    if path.is_file():
+        return str(path)
+    if path.is_dir():
+        candidate = path / filename
+        if candidate.exists():
+            return str(candidate)
+        raise FileNotFoundError(f"Could not find {filename} inside {path}.")
+
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(path_or_repo_id, filename)
+
+
+def _strip_prefix(state_dict: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+    if not all(key.startswith(prefix) for key in state_dict):
+        return state_dict
+    return {key[len(prefix) :]: value for key, value in state_dict.items()}
+
+
+def _load_state_dict_best_effort(
+    medusa_heads: MedusaHeadStack,
+    state_dict: dict[str, torch.Tensor],
+) -> tuple[list[str], list[str]]:
+    """Load official Medusa `medusa_lm_head.pt` keys into `MedusaHeadStack`."""
+    candidates: list[tuple[nn.Module, dict[str, torch.Tensor]]] = [
+        (medusa_heads, state_dict),
+        (medusa_heads, _strip_prefix(state_dict, "medusa_head.")),
+        (medusa_heads, _strip_prefix(state_dict, "heads.")),
+        (medusa_heads.heads, state_dict),
+        (medusa_heads.heads, _strip_prefix(state_dict, "medusa_head.")),
+        (medusa_heads.heads, _strip_prefix(state_dict, "heads.")),
+    ]
+
+    best_missing: list[str] | None = None
+    best_unexpected: list[str] | None = None
+    best_module: nn.Module | None = None
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    best_score: int | None = None
+
+    for module, candidate_state_dict in candidates:
+        result = module.load_state_dict(candidate_state_dict, strict=False)
+        score = len(result.missing_keys) + len(result.unexpected_keys)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_missing = list(result.missing_keys)
+            best_unexpected = list(result.unexpected_keys)
+            best_module = module
+            best_state_dict = candidate_state_dict
+
+    if best_module is None or best_state_dict is None or best_missing is None or best_unexpected is None:
+        raise RuntimeError("Could not load Medusa head state dict.")
+
+    result = best_module.load_state_dict(best_state_dict, strict=False)
+    return list(result.missing_keys), list(result.unexpected_keys)
+
+
+def load_official_medusa_heads(
+    target_model: torch.nn.Module,
+    medusa_heads_path: str,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+    medusa_num_heads: int | None = None,
+    medusa_num_layers: int | None = None,
+    filename: str = "medusa_lm_head.pt",
+) -> MedusaHeadStack:
+    """Load public FasterDecoding-style Medusa heads for a target model.
+
+    `medusa_heads_path` can be a Hugging Face repo id, a local directory
+    containing `medusa_lm_head.pt`, or the checkpoint file itself.
+    """
+    hidden_size, vocab_size, num_heads, num_layers = infer_medusa_head_shape(
+        target_model,
+        medusa_heads_path,
+        medusa_num_heads=medusa_num_heads,
+        medusa_num_layers=medusa_num_layers,
+    )
+    medusa_heads = MedusaHeadStack(
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        num_heads=num_heads,
+        num_layers=num_layers,
+    )
+
+    checkpoint_path = _resolve_medusa_head_file(medusa_heads_path, filename=filename)
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Expected Medusa checkpoint to contain a state dict, got {type(state_dict).__name__}.")
+    missing_keys, unexpected_keys = _load_state_dict_best_effort(medusa_heads, state_dict)
+    if missing_keys or unexpected_keys:
+        print(
+            "Loaded Medusa heads with non-strict key match: "
+            f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}",
+            flush=True,
+        )
+
+    if device is None:
+        device = model_device(target_model, torch.empty(1, dtype=torch.long))
+    if dtype is None:
+        try:
+            dtype = next(target_model.parameters()).dtype
+        except StopIteration:
+            dtype = torch.float32
+    return medusa_heads.to(device=device, dtype=dtype).eval()
 
 
 def linear_medusa_choices(num_heads: int) -> list[list[int]]:
@@ -433,6 +584,7 @@ def generate(
     top_k_logits: int = 0,
     progress: bool = False,
     heartbeat_seconds: float = 0.0,
+    step_callback: Callable[[MedusaStepTrace, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     """Generate with Medusa-style heads and slow path verification."""
     validate_generate_inputs(prompt_token_ids, max_new_tokens, num_assistant_tokens=top_k)
@@ -483,26 +635,27 @@ def generate(
             )
             generated = torch.cat([generated, verification.appended_tokens], dim=-1)
 
+            step_trace = MedusaStepTrace(
+                step=step,
+                prefix_length=prefix_length,
+                remaining_new_tokens=remaining,
+                candidate_path_count=candidates.candidate_paths.shape[0],
+                target_next_token=candidates.target_next_token,
+                medusa_top_tokens=candidates.medusa_top_tokens,
+                selected_path_index=verification.path_index,
+                selected_path_tokens=verification.path_tokens[0].tolist(),
+                target_predictions=verification.target_predictions[0].tolist(),
+                target_top_logits=verification.target_top_logits,
+                accepted_count=verification.accepted_count,
+                rejected_at=verification.rejected_at,
+                appended_tokens=verification.appended_tokens[0].tolist(),
+                output_length=generated.shape[-1],
+                stop_reason=stop_reason_for(generated, prompt_length, max_new_tokens, eos_token_ids, min_length),
+            )
             if trace_steps is not None:
-                trace_steps.append(
-                    MedusaStepTrace(
-                        step=step,
-                        prefix_length=prefix_length,
-                        remaining_new_tokens=remaining,
-                        candidate_path_count=candidates.candidate_paths.shape[0],
-                        target_next_token=candidates.target_next_token,
-                        medusa_top_tokens=candidates.medusa_top_tokens,
-                        selected_path_index=verification.path_index,
-                        selected_path_tokens=verification.path_tokens[0].tolist(),
-                        target_predictions=verification.target_predictions[0].tolist(),
-                        target_top_logits=verification.target_top_logits,
-                        accepted_count=verification.accepted_count,
-                        rejected_at=verification.rejected_at,
-                        appended_tokens=verification.appended_tokens[0].tolist(),
-                        output_length=generated.shape[-1],
-                        stop_reason=stop_reason_for(generated, prompt_length, max_new_tokens, eos_token_ids, min_length),
-                    )
-                )
+                trace_steps.append(step_trace)
+            if step_callback is not None:
+                step_callback(step_trace, generated)
 
             if progress:
                 print(
@@ -527,6 +680,7 @@ def generate_with_trace(
     top_k_logits: int = 0,
     progress: bool = False,
     heartbeat_seconds: float = 0.0,
+    step_callback: Callable[[MedusaStepTrace, torch.Tensor], None] | None = None,
 ) -> tuple[torch.Tensor, list[MedusaStepTrace]]:
     trace_steps: list[MedusaStepTrace] = []
     output_ids = generate(
@@ -542,5 +696,37 @@ def generate_with_trace(
         top_k_logits=top_k_logits,
         progress=progress,
         heartbeat_seconds=heartbeat_seconds,
+        step_callback=step_callback,
     )
     return output_ids, trace_steps
+
+
+def print_trace(
+    trace_steps: list[MedusaStepTrace],
+    tokenizer: Any | None = None,
+    show_logits: bool = False,
+) -> None:
+    for item in trace_steps:
+        print(f"\nMEDUSA STEP {item.step}")
+        print(f"prefix length: {item.prefix_length}")
+        print(f"remaining new-token budget: {item.remaining_new_tokens}")
+        print(f"candidate paths: {item.candidate_path_count}")
+        print(f"target next token: {item.target_next_token}")
+        if tokenizer is not None:
+            print(f"target next text: {tokenizer.decode([item.target_next_token])!r}")
+        print(f"medusa top tokens by head: {item.medusa_top_tokens}")
+        print(f"selected path index: {item.selected_path_index}")
+        print(f"selected path tokens: {item.selected_path_tokens}")
+        if tokenizer is not None:
+            print(f"selected path text: {tokenizer.decode(item.selected_path_tokens)!r}")
+        print(f"target predictions plus bonus: {item.target_predictions}")
+        if show_logits:
+            for idx, summary in enumerate(item.target_top_logits):
+                print(f"target logits top-k for verify[{idx}]: {format_top_logits(summary, tokenizer)}")
+        print(f"accepted count: {item.accepted_count}")
+        print(f"rejected at: {item.rejected_at}")
+        print(f"appended tokens: {item.appended_tokens}")
+        if tokenizer is not None:
+            print(f"appended text: {tokenizer.decode(item.appended_tokens)!r}")
+        print(f"output length: {item.output_length}")
+        print(f"stop reason after step: {item.stop_reason}")

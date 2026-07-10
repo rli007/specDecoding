@@ -232,6 +232,65 @@ with `propose_tree(input_ids, hidden_states, target_logits, max_depth, top_k,
 max_paths)` returning candidate token paths. This keeps the algorithm readable
 and avoids hiding the important work inside a framework `generate()` call.
 
+Run the smallest public Medusa setup we have discussed:
+
+```bash
+python tools/run_local_medusa.py \
+  --base-model lmsys/vicuna-7b-v1.3 \
+  --medusa-heads FasterDecoding/medusa-vicuna-7b-v1.3 \
+  --prompt "The professor asked for" \
+  --max-new-tokens 1 \
+  --device mps \
+  --dtype float16 \
+  --progress
+```
+
+That command still loads a 7B Vicuna base model plus the Medusa heads. The
+default `--choice-preset linear --top-k 1` verifies one Medusa path and is the
+best first local smoke test. After that works, try `--choice-preset small-tree
+--top-k 2` to inspect branching behavior; it will be slower because this repo
+verifies paths one at a time instead of using optimized Medusa tree attention.
+
+For a longer Medusa-paper-style sequence, keep the fast linear path and log the
+partial text after every accepted continuation:
+
+```bash
+python tools/run_local_medusa.py \
+  --base-model lmsys/vicuna-7b-v1.3 \
+  --medusa-heads FasterDecoding/medusa-vicuna-7b-v1.3 \
+  --prompt "The professor asked for" \
+  --longer-sentence \
+  --device mps \
+  --dtype float16 \
+  --progress \
+  --output-txt run_logs/medusa_longer_sentence.txt
+```
+
+`--longer-sentence` currently means 12 new tokens. This is still slower than
+the paper's implementation because the repo intentionally uses ordinary target
+forwards to verify candidate paths instead of Medusa's optimized tree attention.
+
+Run a tiny MT-Bench-style Medusa generation pass:
+
+```bash
+python tools/run_medusa_mtbench.py \
+  --question-file examples/mini_mtbench_questions.jsonl \
+  --limit 1 \
+  --max-new-tokens 16 \
+  --device mps \
+  --dtype float16 \
+  --progress
+```
+
+This writes FastChat-shaped answers to
+`run_logs/medusa_mtbench_mini_answers.jsonl` and detailed Medusa step traces to
+`run_logs/medusa_mtbench_mini_answers.traces.jsonl`. The bundled question file
+is only a local smoke test. For the real MT-Bench questions, download
+FastChat's `question.jsonl` and pass it with `--question-file`. A full
+paper-style run also needs an LLM judge, usually through the FastChat judge
+scripts, but start with generation-only because this inspectable Medusa verifier
+is intentionally much slower than optimized tree attention.
+
 ## Current Limitations
 
 - Batch size is 1.
