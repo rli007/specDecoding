@@ -74,10 +74,10 @@ projects in several ways. First, it allows developers to"). Greedy Medusa is
 lossless, as designed. **Do not re-litigate algorithm correctness** — that part
 is settled. Effort belongs on metrics, tree sizing, and the Voyager mapping.
 
-### Uncommitted working diff (verified 2026-07-29): instrumentation only
+### Timing instrumentation (commit de66c17, 2026-07-29): no algorithm changes
 
-The dirty diff on `medusa_speculative_decoder.py` (+460/−132) and
-`run_medusa_mtbench.py` contains **no algorithm changes**. It adds a
+The +460/−132 change to `medusa_speculative_decoder.py` and
+`run_medusa_mtbench.py` is **pure instrumentation**. It adds a
 `--verbose-timing` flag: every stage of a step (prefill forward, tree target
 forward, Medusa heads, logit reorder, posterior eval, cache copy, trace
 packaging, append/state update) is wrapped in a device-synchronized
@@ -104,18 +104,25 @@ tools/
   run_local_medusa.py                      one prompt, full human-readable trace
   run_medusa_mtbench.py                    MT-Bench loop -> answers.jsonl + traces.jsonl
   run_vicuna_mtbench_baseline.py           plain greedy, same harness (apples-to-apples)
-  judge_openrouter_mtbench.py              GPT-4o judge via OpenRouter (UNCOMMITTED)
+  judge_openrouter_mtbench.py              GPT-4o judge via OpenRouter
   compare_hf_vs_stripped_assisted_steps.py HF-vs-ours differential test
   smoke_algorithm_decoders.py              tiny no-download sanity check
 
-scripts/medusa_gpu_suite/                  CUDA wrappers: medusa -> baseline -> judge (UNCOMMITTED)
+scripts/medusa_gpu_suite/                  CUDA wrappers: medusa -> baseline -> judge
 NOTES_FOR_MENTOR.md                        1-page status: N* finding, quant/spec tension, Voyager
-                                           plan, 4 open hardware questions (UNCOMMITTED)
-run_logs/                                  every run's answers + per-step traces
+                                           plan, 4 open hardware questions
+run_logs/                                  GITIGNORED — exists only on this machine, no backup.
+                                           Current apples-to-apples set (Jul 23): greedy_rerun,
+                                           tree_rerun, baseline_rerun answers + traces
   latest_three_run_analysis.txt            useful prose analysis of the Jul 23 runs
+  archive/                                 superseded runs (May 12 differential-test logs,
+                                           mini-file smoke run, non-lossless typical run,
+                                           first baseline, one-off longer-sentence trace)
 examples/mini_mtbench_questions.jsonl      1-question smoke file, NOT real MT-Bench
-reference/                                 HF source excerpts used while reimplementing
-archive/                                   superseded experiments
+archive/                                   superseded experiments; also holds the May-era HF
+                                           source excerpts (archive/reference/, moved from
+                                           top-level reference/ 2026-07-29) and the draft-model
+                                           interactive REPL (archive/tools/)
 ```
 
 ### Non-negotiable design rule
@@ -558,6 +565,8 @@ the real branch becomes load-bearing.
   guards degrade to re-prefill rather than corrupting state.
 - Vicuna/Llama weights are gated: `huggingface-cli login` first.
 - Judge needs `OPENROUTER_API_KEY`.
-- `scripts/`, `tools/judge_openrouter_mtbench.py`, `NOTES_FOR_MENTOR.md`, and
-  this `CLAUDE.md` are **untracked** — commit them.
+- Everything is committed as of `de66c17` (2026-07-29). **Exception:
+  `run_logs/` is gitignored** — the acceptance traces are the measured
+  numerator of the speedup equation and have no backup; consider un-ignoring
+  them or copying them somewhere durable.
 - Batch size 1 throughout. Target and assistant assumed to share a tokenizer.

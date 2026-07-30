@@ -68,24 +68,9 @@ model forwards. It does not call HF `generate()` inside the local decoder.
   interface. Exact EAGLE/EAGLE3 behavior requires trained EAGLE draft weights
   paired with the target model.
 
-- `tools/interactive_llama_speculative_session.py`  
-  Interactive Llama session that loads the models once and reuses them across
-  prompts.
-
-- `reference/candidate_generation.txt`  
-  Hugging Face candidate-generator excerpts.
-
-- `reference/relevant_portions.txt`  
-  Hugging Face `_assisted_decoding` excerpts.
-
-- `reference/static_cache_generation_reference.txt`  
-  The stripped-down static-cache `generate` reference that inspired the local
-  style.
-
-- `reference/recommended_model_pairs.txt`  
-  Compatible target/assistant model notes.
-
-Archived earlier experiments live in `archive/`.
+Archived earlier experiments live in `archive/`, along with the Hugging Face
+source excerpts used during reimplementation (`archive/reference/`) and the
+interactive draft-model session tool (`archive/tools/`).
 
 ## Setup
 
