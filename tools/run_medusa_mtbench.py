@@ -117,6 +117,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k-logits", type=int, default=0, help="Store target top-k logits in trace; 0 disables.")
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument(
+        "--verbose-timing",
+        action="store_true",
+        help="Print and store detailed per-step timing for prefill, tree verification, Medusa heads, cache copy, etc.",
+    )
     parser.add_argument("--no-step-text", action="store_false", dest="step_text")
     parser.add_argument("--heartbeat-seconds", type=float, default=5.0)
     parser.add_argument("--dry-run", action="store_true", help="Read questions and print prompts without loading models.")
@@ -217,15 +222,46 @@ def trace_to_json(trace_steps: list[MedusaStepTrace]) -> list[dict[str, Any]]:
                 "tree_node_count": step.tree_node_count,
                 "cache_updated": step.cache_updated,
                 "fallback_reason": step.fallback_reason,
+                "timings": step.timings,
             }
         )
     return result
+
+
+def timing_totals(trace_steps: list[MedusaStepTrace]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    for step in trace_steps:
+        for name, elapsed in step.timings.items():
+            totals[name] = totals.get(name, 0.0) + float(elapsed)
+    return dict(sorted(totals.items()))
+
+
+def format_timing_summary(timings: dict[str, float], max_items: int = 8) -> str:
+    if not timings:
+        return "timings=n/a"
+    priority = [
+        "step_total",
+        "prefill_target_forward",
+        "reprefill_target_forward",
+        "verify_total",
+        "tree_target_forward",
+        "tree_medusa_heads",
+        "candidate_generation",
+        "posterior_eval",
+        "cache_copy",
+        "append_and_state_update",
+    ]
+    names = [name for name in priority if name in timings]
+    names.extend(name for name in timings if name not in names)
+    selected = names[:max_items]
+    return ", ".join(f"{name}={timings[name]:.2f}s" for name in selected)
 
 
 def summarize_trace(trace_steps: list[MedusaStepTrace], generated_token_count: int, elapsed_seconds: float) -> dict[str, Any]:
     medusa_steps = len(trace_steps)
     accepted_total = sum(step.accepted_count for step in trace_steps)
     appended_total = sum(len(step.appended_tokens) for step in trace_steps)
+    timings = timing_totals(trace_steps)
     return {
         "generated_token_count": generated_token_count,
         "elapsed_seconds": elapsed_seconds,
@@ -235,6 +271,7 @@ def summarize_trace(trace_steps: list[MedusaStepTrace], generated_token_count: i
         "appended_token_count": appended_total,
         "accepted_tokens_per_step": accepted_total / medusa_steps if medusa_steps else 0.0,
         "appended_tokens_per_step": appended_total / medusa_steps if medusa_steps else 0.0,
+        "timing_totals": timings,
     }
 
 
@@ -268,6 +305,7 @@ def main() -> None:
     print(f"max_new_tokens per turn: {args.max_new_tokens}")
     print(f"choice preset: {args.choice_preset}, top_k={args.top_k}")
     print(f"verifier: {args.verifier}, acceptance={args.acceptance}, use_kv_cache={args.use_kv_cache}")
+    print(f"verbose timing: {args.verbose_timing}")
     print_hardware_status(device)
 
     questions = read_questions(question_path, limit=args.limit, offset=args.offset)
@@ -363,6 +401,12 @@ def main() -> None:
                     f"partial={trim_answer(new_text, stop_strings)!r}",
                     flush=True,
                 )
+                if args.verbose_timing:
+                    print(
+                        f"[question {question.question_id} turn {turn_index} step {step_trace.step}] "
+                        f"timing {format_timing_summary(step_trace.timings)}",
+                        flush=True,
+                    )
 
             started = time.perf_counter()
             with torch.inference_mode():
@@ -386,6 +430,7 @@ def main() -> None:
                     top_p=args.top_p,
                     use_kv_cache=args.use_kv_cache,
                     fallback_to_slow=args.fallback_to_slow,
+                    verbose_timing=args.verbose_timing,
                 )
             elapsed = time.perf_counter() - started
             generated_ids = output_ids[0, prompt_length:]
@@ -411,6 +456,12 @@ def main() -> None:
                 f"tok/s={stats['tokens_per_second']:.3f}",
                 flush=True,
             )
+            if args.verbose_timing:
+                print(
+                    f"[question {question.question_id} turn {turn_index}] "
+                    f"timing totals {format_timing_summary(stats['timing_totals'], max_items=12)}",
+                    flush=True,
+                )
             print(f"[question {question.question_id} turn {turn_index}] answer: {answer!r}", flush=True)
 
             append_jsonl(

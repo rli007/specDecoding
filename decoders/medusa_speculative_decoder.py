@@ -16,8 +16,10 @@ class below is the architecture shell; random heads are only good for tracing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Any, Callable, Iterable, Literal, Sequence
 
 import torch
@@ -34,6 +36,7 @@ from decoders.first_principles_speculative_decoder import (
     should_stop,
     stop_reason_for,
     summarize_top_logits,
+    synchronize_device,
     target_predictions_for_draft,
     timed_operation,
     validate_generate_inputs,
@@ -99,10 +102,47 @@ class MedusaStepTrace:
     tree_node_count: int = 0
     cache_updated: bool = False
     fallback_reason: str | None = None
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 AcceptanceMode = Literal["greedy", "typical", "nucleus"]
 VerifierMode = Literal["tree", "slow"]
+
+
+def _add_timing(timings: dict[str, float] | None, name: str, elapsed_seconds: float) -> None:
+    if timings is None:
+        return
+    timings[name] = timings.get(name, 0.0) + float(elapsed_seconds)
+
+
+@contextmanager
+def _timed_section(
+    name: str,
+    device: torch.device,
+    timings: dict[str, float] | None = None,
+    verbose: bool = False,
+    prefix: str = "",
+):
+    synchronize_device(device)
+    started = time.perf_counter()
+    try:
+        yield
+        synchronize_device(device)
+    finally:
+        elapsed = time.perf_counter() - started
+        _add_timing(timings, name, elapsed)
+        if verbose:
+            print(f"{prefix}{name}={elapsed:.3f}s", flush=True)
+
+
+def _start_timed_step(device: torch.device) -> float:
+    synchronize_device(device)
+    return time.perf_counter()
+
+
+def _finish_timed_step(device: torch.device, started: float, timings: dict[str, float], name: str = "step_total") -> None:
+    synchronize_device(device)
+    _add_timing(timings, name, time.perf_counter() - started)
 
 
 VICUNA_7B_STAGE2_CHOICES: list[tuple[int, ...]] = [
@@ -994,6 +1034,8 @@ def verify_candidate_tree(
     posterior_alpha: float = 0.3,
     top_p: float = 0.8,
     use_kv_cache: bool = True,
+    timings: dict[str, float] | None = None,
+    verbose_timing: bool = False,
 ) -> MedusaVerification:
     """Verify all Medusa candidate paths in one tree-attention forward."""
     del eos_token_ids, min_length
@@ -1008,33 +1050,72 @@ def verify_candidate_tree(
             flush=True,
         )
 
-    dtype = _model_dtype(target_model)
-    attention_mask = _additive_tree_attention_mask(prefix_length, buffers, dtype=dtype, device=generated.device)
-    position_ids = (buffers.position_ids + prefix_length).unsqueeze(0).to(generated.device)
-    tree_logits, hidden_states, next_cache = forward_target_with_hidden_cache(
-        target_model,
-        candidates.tree_candidates,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
-        progress_label=f"[step {step}] target tree verify forward" if progress or heartbeat_seconds > 0 else None,
-        heartbeat_seconds=heartbeat_seconds,
-        strict_kwargs=True,
-    )
-    tree_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
-    path_logits = _reorder_tree_logits(tree_logits, buffers.retrieve_indices)
-    path_medusa_logits = _reorder_tree_medusa_logits(tree_medusa_logits, buffers.retrieve_indices)
+    timing_prefix = f"[medusa step {step}] timing " if step is not None else "[medusa] timing "
+    with _timed_section(
+        "tree_attention_setup",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        dtype = _model_dtype(target_model)
+        attention_mask = _additive_tree_attention_mask(prefix_length, buffers, dtype=dtype, device=generated.device)
+        position_ids = (buffers.position_ids + prefix_length).unsqueeze(0).to(generated.device)
 
-    best_index, accepted_future = evaluate_posterior(
-        path_logits,
-        candidates.candidate_paths,
-        acceptance_mode=acceptance_mode,
-        temperature=temperature,
-        posterior_threshold=posterior_threshold,
-        posterior_alpha=posterior_alpha,
-        top_p=top_p,
-    )
+    with _timed_section(
+        "tree_target_forward",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        tree_logits, hidden_states, next_cache = forward_target_with_hidden_cache(
+            target_model,
+            candidates.tree_candidates,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            progress_label=f"[step {step}] target tree verify forward" if progress or heartbeat_seconds > 0 else None,
+            heartbeat_seconds=heartbeat_seconds,
+            strict_kwargs=True,
+        )
+
+    with _timed_section(
+        "tree_medusa_heads",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        tree_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
+
+    with _timed_section(
+        "tree_reorder_logits",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        path_logits = _reorder_tree_logits(tree_logits, buffers.retrieve_indices)
+        path_medusa_logits = _reorder_tree_medusa_logits(tree_medusa_logits, buffers.retrieve_indices)
+
+    with _timed_section(
+        "posterior_eval",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        best_index, accepted_future = evaluate_posterior(
+            path_logits,
+            candidates.candidate_paths,
+            acceptance_mode=acceptance_mode,
+            temperature=temperature,
+            posterior_threshold=posterior_threshold,
+            posterior_alpha=posterior_alpha,
+            top_p=top_p,
+        )
 
     path_length = int(_candidate_path_lengths(candidates.candidate_paths[best_index : best_index + 1])[0].item())
     requested_append_count = min(path_length, accepted_future + 1)
@@ -1046,27 +1127,41 @@ def verify_candidate_tree(
     selected_tree_indices = buffers.retrieve_indices[best_index, :append_count]
     cache_updated = False
     cache_after = next_cache
-    if next_cache is not None:
-        cache_updated = _copy_selected_tree_cache(next_cache, prefix_length, selected_tree_indices)
-        if not cache_updated:
-            cache_after = None
+    with _timed_section(
+        "cache_copy",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        if next_cache is not None:
+            cache_updated = _copy_selected_tree_cache(next_cache, prefix_length, selected_tree_indices)
+            if not cache_updated:
+                cache_after = None
 
-    root_top_logits = summarize_top_logits(target_logits[:, -1, :], top_k_logits)
-    selected_top_logits = [
-        summarize_top_logits(path_logits[best_index, idx, :].unsqueeze(0), top_k_logits)
-        for idx in range(path_length)
-    ]
-    predictions = torch.cat(
-        [
-            torch.tensor([[candidates.target_next_token]], dtype=generated.dtype, device=generated.device),
-            torch.argmax(path_logits[best_index, :path_length, :], dim=-1, keepdim=True).T.to(generated.dtype),
-        ],
-        dim=-1,
-    )
+    with _timed_section(
+        "trace_packaging",
+        generated.device,
+        timings,
+        verbose=verbose_timing,
+        prefix=timing_prefix,
+    ):
+        root_top_logits = summarize_top_logits(target_logits[:, -1, :], top_k_logits)
+        selected_top_logits = [
+            summarize_top_logits(path_logits[best_index, idx, :].unsqueeze(0), top_k_logits)
+            for idx in range(path_length)
+        ]
+        predictions = torch.cat(
+            [
+                torch.tensor([[candidates.target_next_token]], dtype=generated.dtype, device=generated.device),
+                torch.argmax(path_logits[best_index, :path_length, :], dim=-1, keepdim=True).T.to(generated.dtype),
+            ],
+            dim=-1,
+        )
 
-    next_target_logits = path_logits[best_index, last_state_index : last_state_index + 1, :].unsqueeze(0)
-    next_medusa_logits = path_medusa_logits[:, best_index : best_index + 1, last_state_index : last_state_index + 1, :]
-    rejected_at = requested_append_count if requested_append_count < path_length else None
+        next_target_logits = path_logits[best_index, last_state_index : last_state_index + 1, :].unsqueeze(0)
+        next_medusa_logits = path_medusa_logits[:, best_index : best_index + 1, last_state_index : last_state_index + 1, :]
+        rejected_at = requested_append_count if requested_append_count < path_length else None
 
     return MedusaVerification(
         path_index=best_index,
@@ -1107,6 +1202,7 @@ def generate(
     top_p: float = 0.8,
     use_kv_cache: bool = True,
     fallback_to_slow: bool = True,
+    verbose_timing: bool = False,
 ) -> torch.Tensor:
     """Generate with Medusa-style heads.
 
@@ -1131,58 +1227,119 @@ def generate(
     state_medusa_logits: torch.Tensor | None = None
     state_past_key_values: Any | None = None
     state_uses_cache = verifier == "tree" and use_kv_cache
+    pending_prefill_timings: dict[str, float] = {}
 
     with torch.inference_mode():
         if verifier == "tree":
-            state_target_logits, hidden_states, state_past_key_values = forward_target_with_hidden_cache(
-                target_model,
-                generated,
-                use_cache=state_uses_cache,
-                progress_label="[medusa prefill] target forward" if progress or heartbeat_seconds > 0 else None,
-                heartbeat_seconds=heartbeat_seconds,
-            )
-            state_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
+            with _timed_section(
+                "prefill_target_forward",
+                generated.device,
+                pending_prefill_timings,
+                verbose=verbose_timing,
+                prefix="[medusa prefill] timing ",
+            ):
+                state_target_logits, hidden_states, state_past_key_values = forward_target_with_hidden_cache(
+                    target_model,
+                    generated,
+                    use_cache=state_uses_cache,
+                    progress_label="[medusa prefill] target forward" if progress or heartbeat_seconds > 0 else None,
+                    heartbeat_seconds=heartbeat_seconds,
+                )
+            with _timed_section(
+                "prefill_medusa_heads",
+                generated.device,
+                pending_prefill_timings,
+                verbose=verbose_timing,
+                prefix="[medusa prefill] timing ",
+            ):
+                state_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
 
         step = 1
         while generated.shape[-1] - prompt_length < max_new_tokens:
+            step_timings: dict[str, float] = dict(pending_prefill_timings)
+            pending_prefill_timings.clear()
+            step_started = _start_timed_step(generated.device)
+
             if should_stop(generated, eos_token_ids, min_length):
                 break
 
             prefix_length = generated.shape[-1]
             remaining = max_new_tokens - (prefix_length - prompt_length)
             if verifier == "tree" and (state_target_logits is None or state_medusa_logits is None):
-                state_target_logits, hidden_states, state_past_key_values = forward_target_with_hidden_cache(
-                    target_model,
-                    generated,
-                    use_cache=state_uses_cache,
-                    progress_label=f"[medusa step {step}] target re-prefill forward"
-                    if progress or heartbeat_seconds > 0
-                    else None,
-                    heartbeat_seconds=heartbeat_seconds,
-                )
-                state_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
+                with _timed_section(
+                    "reprefill_target_forward",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
+                    state_target_logits, hidden_states, state_past_key_values = forward_target_with_hidden_cache(
+                        target_model,
+                        generated,
+                        use_cache=state_uses_cache,
+                        progress_label=f"[medusa step {step}] target re-prefill forward"
+                        if progress or heartbeat_seconds > 0
+                        else None,
+                        heartbeat_seconds=heartbeat_seconds,
+                    )
+                with _timed_section(
+                    "reprefill_medusa_heads",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
+                    state_medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
 
             if verifier == "tree" and state_target_logits is not None and state_medusa_logits is not None:
                 target_logits = state_target_logits
                 medusa_logits = state_medusa_logits
             else:
-                target_logits, hidden_states = forward_target_with_hidden(target_model, generated)
-                medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
+                with _timed_section(
+                    "state_target_forward",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
+                    target_logits, hidden_states = forward_target_with_hidden(target_model, generated)
+                with _timed_section(
+                    "state_medusa_heads",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
+                    medusa_logits = normalize_medusa_logits(medusa_heads(hidden_states), hidden_states)
 
             if buffers is None:
-                choices = list(medusa_choices) if medusa_choices is not None else linear_medusa_choices(medusa_logits.shape[0])
-                buffers = generate_medusa_buffers(choices, top_k=top_k, device=generated.device)
+                with _timed_section(
+                    "buffer_build",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
+                    choices = list(medusa_choices) if medusa_choices is not None else linear_medusa_choices(medusa_logits.shape[0])
+                    buffers = generate_medusa_buffers(choices, top_k=top_k, device=generated.device)
 
-            candidates = generate_medusa_candidates(
-                target_logits,
-                medusa_logits,
-                buffers,
-                acceptance_mode=acceptance_mode,
-                temperature=temperature,
-                posterior_threshold=posterior_threshold,
-                posterior_alpha=posterior_alpha,
-                top_p=top_p,
-            )
+            with _timed_section(
+                "candidate_generation",
+                generated.device,
+                step_timings,
+                verbose=verbose_timing,
+                prefix=f"[medusa step {step}] timing ",
+            ):
+                candidates = generate_medusa_candidates(
+                    target_logits,
+                    medusa_logits,
+                    buffers,
+                    acceptance_mode=acceptance_mode,
+                    temperature=temperature,
+                    posterior_threshold=posterior_threshold,
+                    posterior_alpha=posterior_alpha,
+                    top_p=top_p,
+                )
             if progress:
                 print(
                     f"[medusa step {step}] prefix_len={prefix_length} "
@@ -1195,34 +1352,71 @@ def generate(
             fallback_reason: str | None = None
             if verifier == "tree":
                 try:
-                    verification = verify_candidate_tree(
-                        target_model,
-                        medusa_heads,
-                        generated,
-                        candidates,
-                        buffers,
-                        state_past_key_values,
-                        eos_token_ids,
-                        min_length,
-                        remaining,
-                        target_logits=target_logits,
-                        top_k_logits=top_k_logits,
-                        progress=progress,
-                        step=step,
-                        heartbeat_seconds=heartbeat_seconds,
-                        acceptance_mode=acceptance_mode,
-                        temperature=temperature,
-                        posterior_threshold=posterior_threshold,
-                        posterior_alpha=posterior_alpha,
-                        top_p=top_p,
-                        use_kv_cache=state_uses_cache,
-                    )
+                    with _timed_section(
+                        "verify_total",
+                        generated.device,
+                        step_timings,
+                        verbose=verbose_timing,
+                        prefix=f"[medusa step {step}] timing ",
+                    ):
+                        verification = verify_candidate_tree(
+                            target_model,
+                            medusa_heads,
+                            generated,
+                            candidates,
+                            buffers,
+                            state_past_key_values,
+                            eos_token_ids,
+                            min_length,
+                            remaining,
+                            target_logits=target_logits,
+                            top_k_logits=top_k_logits,
+                            progress=progress,
+                            step=step,
+                            heartbeat_seconds=heartbeat_seconds,
+                            acceptance_mode=acceptance_mode,
+                            temperature=temperature,
+                            posterior_threshold=posterior_threshold,
+                            posterior_alpha=posterior_alpha,
+                            top_p=top_p,
+                            use_kv_cache=state_uses_cache,
+                            timings=step_timings,
+                            verbose_timing=verbose_timing,
+                        )
                 except Exception as exc:
                     if not fallback_to_slow:
                         raise
                     fallback_reason = f"{type(exc).__name__}: {exc}"
                     if progress:
                         print(f"[medusa step {step}] tree verifier failed; falling back to slow: {fallback_reason}", flush=True)
+                    with _timed_section(
+                        "slow_fallback_verify_total",
+                        generated.device,
+                        step_timings,
+                        verbose=verbose_timing,
+                        prefix=f"[medusa step {step}] timing ",
+                    ):
+                        verification = verify_candidate_paths_slow(
+                            target_model,
+                            generated,
+                            candidates.candidate_paths,
+                            eos_token_ids,
+                            min_length,
+                            remaining,
+                            top_k_logits=top_k_logits,
+                            progress=progress,
+                            step=step,
+                            heartbeat_seconds=heartbeat_seconds,
+                        )
+                    verification.fallback_reason = fallback_reason
+            else:
+                with _timed_section(
+                    "slow_verify_total",
+                    generated.device,
+                    step_timings,
+                    verbose=verbose_timing,
+                    prefix=f"[medusa step {step}] timing ",
+                ):
                     verification = verify_candidate_paths_slow(
                         target_model,
                         generated,
@@ -1235,39 +1429,35 @@ def generate(
                         step=step,
                         heartbeat_seconds=heartbeat_seconds,
                     )
-                    verification.fallback_reason = fallback_reason
-            else:
-                verification = verify_candidate_paths_slow(
-                    target_model,
-                    generated,
-                    candidates.candidate_paths,
-                    eos_token_ids,
-                    min_length,
-                    remaining,
-                    top_k_logits=top_k_logits,
-                    progress=progress,
-                    step=step,
-                    heartbeat_seconds=heartbeat_seconds,
-                )
-            generated = torch.cat([generated, verification.appended_tokens], dim=-1)
 
-            if verifier == "tree" and verification.verification_method == "tree":
-                if (
-                    verification.cache_updated
-                    and verification.next_target_logits is not None
-                    and verification.next_medusa_logits is not None
-                ):
-                    state_target_logits = verification.next_target_logits
-                    state_medusa_logits = verification.next_medusa_logits
-                    state_past_key_values = verification.past_key_values
-                else:
+            with _timed_section(
+                "append_and_state_update",
+                generated.device,
+                step_timings,
+                verbose=verbose_timing,
+                prefix=f"[medusa step {step}] timing ",
+            ):
+                generated = torch.cat([generated, verification.appended_tokens], dim=-1)
+
+                if verifier == "tree" and verification.verification_method == "tree":
+                    if (
+                        verification.cache_updated
+                        and verification.next_target_logits is not None
+                        and verification.next_medusa_logits is not None
+                    ):
+                        state_target_logits = verification.next_target_logits
+                        state_medusa_logits = verification.next_medusa_logits
+                        state_past_key_values = verification.past_key_values
+                    else:
+                        state_target_logits = None
+                        state_medusa_logits = None
+                        state_past_key_values = None
+                elif verifier == "tree":
+                    state_past_key_values = None
                     state_target_logits = None
                     state_medusa_logits = None
-                    state_past_key_values = None
-            elif verifier == "tree":
-                state_past_key_values = None
-                state_target_logits = None
-                state_medusa_logits = None
+
+            _finish_timed_step(generated.device, step_started, step_timings)
 
             step_trace = MedusaStepTrace(
                 step=step,
@@ -1290,6 +1480,7 @@ def generate(
                 tree_node_count=candidates.tree_candidates.shape[-1],
                 cache_updated=verification.cache_updated,
                 fallback_reason=verification.fallback_reason or fallback_reason,
+                timings=dict(sorted(step_timings.items())),
             )
             if trace_steps is not None:
                 trace_steps.append(step_trace)
@@ -1330,6 +1521,7 @@ def generate_with_trace(
     top_p: float = 0.8,
     use_kv_cache: bool = True,
     fallback_to_slow: bool = True,
+    verbose_timing: bool = False,
 ) -> tuple[torch.Tensor, list[MedusaStepTrace]]:
     trace_steps: list[MedusaStepTrace] = []
     output_ids = generate(
@@ -1354,6 +1546,7 @@ def generate_with_trace(
         top_p=top_p,
         use_kv_cache=use_kv_cache,
         fallback_to_slow=fallback_to_slow,
+        verbose_timing=verbose_timing,
     )
     return output_ids, trace_steps
 
@@ -1374,6 +1567,9 @@ def print_trace(
         print(f"cache updated: {item.cache_updated}")
         if item.fallback_reason:
             print(f"fallback reason: {item.fallback_reason}")
+        if item.timings:
+            timings = ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in item.timings.items())
+            print(f"timings: {timings}")
         print(f"target next token: {item.target_next_token}")
         if tokenizer is not None:
             print(f"target next text: {tokenizer.decode([item.target_next_token])!r}")
