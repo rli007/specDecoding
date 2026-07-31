@@ -228,8 +228,12 @@ reshape a custom tree mask.
    `appended - 1`. Translation for existing logs:
    greedy 1.778 appended → τ=0.778; greedy 2.000 → τ=1.000;
    typical 2.667 → τ=1.667.
-   **Planned fix:** emit `accept_length` and `tokens_per_step` as separate
-   trace fields.
+   **Fixed 2026-07-31 (runner-side):** `run_medusa_mtbench.py` now emits
+   per-step `accept_length` + `tokens_per_step` in traces,
+   `accept_length_per_step` (= τ) in per-turn stats, and prints
+   `accept_length/step` in the done line. The `MedusaStepTrace.accepted_count`
+   dataclass field itself is still the misnamed appended count — old trace
+   files keep the old semantics.
 
 2. **`--acceptance typical` is a no-op unless `--temperature > 0`** — with
    `temperature <= 0` it falls through to the greedy branch (:936), and
@@ -425,6 +429,16 @@ Paper: arXiv 2509.15205, "Voyager: An End-to-End Framework for Design-Space
 Exploration and Generation of DNN Accelerators". Sphinx is Voyager-generated.
 Reference: `test/test_codegen.py`.
 
+**A local clone exists at `~/Desktop/voyager/voyager-compiler`** — checked
+2026-07-29: it is behind GitHub main and the CLI has drifted (local:
+`--mixed_precision`, `--hardware_unrolling`, `--remove_duplicate`; main:
+`--enable_mixed_precision`, `pe_array_size` via a config module,
+`--compile_single_layer`, `--attn_implementation`). `git pull` and re-check
+`python test/test_codegen.py --help` before trusting any flag list here,
+including the step-0 command below. `--remove_duplicate` /
+`--compile_single_layer` compiles a SINGLE decoder layer — use it for fast
+iteration and scale results by 32 layers.
+
 Pipeline: PyTorch model → PT2E static graph → quantization (`prepare_pt2e` →
 calibrate → `convert_pt2e`) → `transform()` (fusion, layout, tiling,
 scheduling) → `compile()` (instruction generation) → optional `--report`
@@ -505,6 +519,67 @@ correctness. Verify the sparsity assumption once by diffing reported cycles for
 a causal vs tree mask at the same N; if they differ, the assumption is wrong and
 the real branch becomes load-bearing.
 
+### Sweep scripts (written 2026-07-29, in this repo)
+
+- `tools/voyager_common.py` — Sphinx defaults (64×64 PE, 1 GHz, 68 GB/s
+  ASSUMED bw, 2.5 MB scratchpad, double-buffered L2), the fusion pipeline +
+  `get_llama_qconfig` copied from upstream `test_codegen.py` (main), CSV/report
+  helpers. `set_qconfig` is imported from the clone's
+  `examples/language_modeling` via `--voyager_root`.
+- `tools/voyager_milestone1_decode_sweep.py` — N-token decode-step cost sweep
+  (defaults: N ∈ {1,2,4,8,16,24,32,40,48,64}, Vicuna-7B, SINGLE decoder layer
+  + lm_head for 24 GB-RAM friendliness; `--full_model` for true totals).
+  Mirrors upstream `llm_decode` exactly, then calls
+  `voyager_compiler.codegen.reporting.report()` → cycles + DRAM bytes per N →
+  `decode_sweep.csv`.
+- `tools/voyager_milestone3_medusa_heads.py` — MedusaHeadStack exported alone
+  at P ∈ {1,64} positions; prices §6(a) directly, and `--head_weight_spec`
+  makes the §6(b) 2-bit-heads experiment a one-flag change. Verified
+  end-to-end 2026-07-29 with tiny random geometry (export→…→report all work).
+- Environment notes: `voyager_compiler` is pip-installed editable from the
+  clone (commit 946a222); graphviz `dot` binary installed via brew (compile()
+  renders an SVG and hard-fails without it); torch 2.11 moved
+  `_annotate_output_qspec` to `torchao.quantization.pt2e.quantizer.utils`.
+- **Milestone 1 verified end-to-end 2026-07-29** (real Vicuna, single layer +
+  lm_head, N=1): 5,887,604 cycles = 5.888 ms at 1 GHz, 193.6 MB weight
+  traffic (consistent with ~333M params at ~0.5 B/param + scales). Two
+  non-obvious requirements discovered: (1) `ShapeProp(gm).propagate(...)`
+  must run after `convert_pt2e` — it stamps `node.value`, which
+  `extract_input_preprocessor` needs; (2) constants folded by `convert_pt2e`
+  (e.g. the `index_copy_` KV-write index) carry no memory-space meta and crash
+  the new reporting stage — `stamp_unplaced_constants_as_dram()` in
+  `voyager_common.py` works around it. **Report the reporting crash to the
+  mentor/Jeffrey — likely an untested path on llm_decode.**
+- Open question from the smoke run: `dram_kv_bytes` reports 0 — KV-cache
+  traffic is either being mis-categorized (folded into activation/weight
+  bytes) or not charged. Check before trusting the KV column, especially for
+  the KIVI interaction sweep.
+- **Full sweep result (2026-07-30, single layer + lm_head, nf4_6,
+  `voyager_out/milestone1/decode_sweep.csv`): NO knee in [1,64].** Cycles rise
+  linearly at only ~11.5k cycles/token (≈0.2% of baseline per token):
+  N=1 → 5.888 ms, N=64 → 6.671 ms = **1.133×**. Weight traffic constant
+  (193.6→194.6 MB) as the roofline predicts; the marginal cost matches the
+  marginal activation DMA traffic (~0.54 MB/token ÷ 68 GB/s), i.e. the step
+  stays memory-bound across the whole range and the added compute hides under
+  the weight stream. **This contradicts the §6 sketch's N*≈30 / "64 nodes =
+  2.1× = net slowdown" conclusion** — per the compiler, the 63-node tree
+  costs 1.13× and yields ~1.9/1.13 ≈ 1.7× speedup even at current weak τ.
+  **Probe at N=96/128 (`voyager_out/m1_probe/`) found the knee: N* ≈ 65.**
+  N=96 → 9.486 ms (1.61×), N=128 → 12.462 ms (2.12×). The marginal slope
+  jumps from ~11.5k cycles/token (below 64: DMA-only, memory-bound) to
+  ~90k cycles/token (above: ≈ the 81.3k ideal-compute cycles/token for this
+  graph + DMA) — i.e. the cost model and the roofline reconcile exactly, the
+  regimes are real, and the two-line fit intersects at **N ≈ 65**. The knee
+  sits at ~2× the §6 sketch because the baseline carries ~3 ms of
+  N-independent overhead above its 2.9 ms memory floor, which widens the free
+  region proportionally (N* ≈ baseline/compute-per-token). In the
+  overhead-free limit N* → 2.9 ms/81.3 µs ≈ 36, recovering the sketch's ~30.
+  So: **N* is schedule-dependent — between ~36 (ideal overlap) and ~65 (the
+  schedule Voyager currently emits); Medusa's stock 63-node tree lands
+  almost exactly at the current knee.** Still pending before quoting:
+  (a) attribute the ~3 ms overhead via the perfetto trace; (b) confirm
+  proportions on `--full_model`.
+
 ### Plan
 
 0. **Reproduce the reference unmodified** (~1 day, de-risks everything):
@@ -534,25 +609,28 @@ the real branch becomes load-bearing.
 
 ## 8. Ordered next steps
 
-1. Split `accept_length` (= appended − 1) from `tokens_per_step` in
-   `MedusaStepTrace`. Small; prevents months of confused plots.
-2. Voyager step 0 — reproduce `llm_decode` unmodified.
+1. ~~Split `accept_length` from `tokens_per_step` in traces~~ **DONE
+   2026-07-31** (runner-side; see gotcha §5.1).
+2. Voyager step 0 — reproduce `llm_decode` unmodified. **DONE** (see §7).
 3. Stop quoting local absolute timings. `--verbose-timing` is for *relative*
    stage breakdown only.
-4. Parameterize tree size so the sweep is a flag, not a code edit.
-   **Truncate the raw `VICUNA_7B_STAGE2_CHOICES` list order, NOT the sorted
-   order.** The stored order is the authors' greedy expected-value selection
-   order — `(0,), (0,0), (1,), (0,1), (0,0,0), …` — so a prefix of it is a
-   sensible mixed-depth small tree, and it is automatically prefix-closed at
-   every cut (greedy cannot add `(0,0)` before `(0,)`).
-   `_validate_tree_choices` sorts by `(len, values)` for buffer construction;
-   truncating *that* order would take all ten depth-1 nodes first, giving an
-   8-node tree of eight depth-1 siblings whose max accept length is 1. Useless.
-   Best-but-more-work: re-run the authors' greedy node selection at each budget
-   (needs per-head top-k hit rates from calibration data), since the optimal
-   8-node tree is not necessarily the first 8 nodes of the optimal 63-node one.
+4. ~~Parameterize tree size~~ **DONE 2026-07-31**: `--tree-size N` (total
+   nodes incl. free root) on `run_local_medusa.py` / `run_medusa_mtbench.py`,
+   `TREE_SIZE=N` on the GPU-suite wrapper. It truncates the **raw stored
+   choice order** (the authors' greedy expected-value selection order), which
+   is prefix-closed at every cut — verified for N ∈ {2,4,8,16,32,64}.
+   NEVER truncate the `(len, values)`-sorted order `_validate_tree_choices`
+   produces: that takes all ten depth-1 siblings first (max accept length 1).
+   Best-but-more-work upgrade remains: re-run the authors' greedy node
+   selection at each budget from per-head hit-rate calibration.
 5. Single-position Medusa-head optimization (§6).
-6. Longer MT-Bench runs (≥128 tokens, real `question.jsonl`) for reliable τ.
+6. Longer MT-Bench runs for reliable τ: **mentor-ready 2026-07-31.**
+   `scripts/medusa_gpu_suite/04_run_full_mtbench.sh` = real 80-question
+   MT-Bench (auto-downloaded by `00_download_mtbench_questions.sh` to
+   `data/mt_bench/question.jsonl`), 512 tokens/turn, Medusa at
+   TREE_SIZES {64,32,16,8,4} + greedy baseline, timing/step-text prints off,
+   results in `run_logs/gpu_suite_full/`. Needs a ≥24 GB CUDA GPU and
+   HF login; no API keys. Judging (03) stays optional/local.
 
 ---
 

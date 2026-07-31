@@ -95,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         default="official-vicuna-7b",
         help="Official presets are sparse Medusa trees; linear is the smallest debugging path.",
     )
+    parser.add_argument(
+        "--tree-size",
+        type=int,
+        default=None,
+        help="Total tree nodes including the free root. Keeps the first tree_size - 1 paths "
+        "of the preset's stored (greedy selection) order, which is prefix-closed at every cut. "
+        "Default keeps the full preset.",
+    )
     parser.add_argument("--verifier", choices=("tree", "slow"), default="tree")
     parser.add_argument("--acceptance", choices=("greedy", "typical", "nucleus"), default="greedy")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -213,6 +221,8 @@ def trace_to_json(trace_steps: list[MedusaStepTrace]) -> list[dict[str, Any]]:
                     {"token_ids": item.token_ids, "values": item.values} for item in step.target_top_logits
                 ],
                 "accepted_count": step.accepted_count,
+                "accept_length": len(step.appended_tokens) - 1,
+                "tokens_per_step": len(step.appended_tokens),
                 "rejected_at": step.rejected_at,
                 "appended_tokens": step.appended_tokens,
                 "output_length": step.output_length,
@@ -271,6 +281,7 @@ def summarize_trace(trace_steps: list[MedusaStepTrace], generated_token_count: i
         "appended_token_count": appended_total,
         "accepted_tokens_per_step": accepted_total / medusa_steps if medusa_steps else 0.0,
         "appended_tokens_per_step": appended_total / medusa_steps if medusa_steps else 0.0,
+        "accept_length_per_step": (appended_total - medusa_steps) / medusa_steps if medusa_steps else 0.0,
         "timing_totals": timings,
     }
 
@@ -368,6 +379,7 @@ def main() -> None:
 
     choices = medusa_choices_for(args, medusa_heads.num_heads)
     print(f"Medusa choice paths: {choices}")
+    print(f"Medusa tree nodes (paths + free root): {len(choices) + 1}")
 
     suite_started = time.perf_counter()
     for question_index, question in enumerate(questions, start=1):
@@ -452,7 +464,8 @@ def main() -> None:
                 f"[question {question.question_id} turn {turn_index}] "
                 f"done tokens={stats['generated_token_count']} "
                 f"steps={stats['medusa_steps']} "
-                f"accepted/step={stats['accepted_tokens_per_step']:.2f} "
+                f"tokens/step={stats['appended_tokens_per_step']:.2f} "
+                f"accept_length/step={stats['accept_length_per_step']:.2f} "
                 f"tok/s={stats['tokens_per_second']:.3f}",
                 flush=True,
             )

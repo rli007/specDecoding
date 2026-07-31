@@ -1,0 +1,3 @@
+label,size,cycles,ms,dram_read_bytes,dram_write_bytes,dram_weight_bytes,dram_activation_bytes,dram_kv_bytes
+decode_N1,1,5887604,5.887604,189760780,9945588,193560584,6145784,0
+decode_N64,64,6670888,6.670888,206000384,28040448,194593792,39447040,0

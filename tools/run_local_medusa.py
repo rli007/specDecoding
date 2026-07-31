@@ -65,6 +65,14 @@ def parse_args() -> argparse.Namespace:
         default="official-vicuna-7b",
         help="Official presets are sparse Medusa trees; linear is the smallest debugging path.",
     )
+    parser.add_argument(
+        "--tree-size",
+        type=int,
+        default=None,
+        help="Total tree nodes including the free root. Keeps the first tree_size - 1 paths "
+        "of the preset's stored order (the authors' greedy selection order, prefix-closed at "
+        "every cut). Default keeps the full preset.",
+    )
     parser.add_argument("--verifier", choices=("tree", "slow"), default="tree")
     parser.add_argument("--acceptance", choices=("greedy", "typical", "nucleus"), default="greedy")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -97,10 +105,25 @@ def model_kwargs_from_args(args: argparse.Namespace) -> dict:
 
 def medusa_choices_for(args: argparse.Namespace, num_heads: int):
     if args.choice_preset == "small-tree":
-        return small_medusa_tree_choices(num_heads, args.top_k)
-    if args.choice_preset.startswith("official-"):
-        return official_medusa_choices(args.choice_preset, num_heads, args.top_k)
-    return linear_medusa_choices(num_heads)
+        choices = small_medusa_tree_choices(num_heads, args.top_k)
+    elif args.choice_preset.startswith("official-"):
+        choices = official_medusa_choices(args.choice_preset, num_heads, args.top_k)
+    else:
+        choices = linear_medusa_choices(num_heads)
+
+    # Truncation must happen on the stored path order, NOT the (len, values) order
+    # _validate_tree_choices sorts into: the stored order is the authors' greedy
+    # expected-value selection order, so every prefix of it is a sensible
+    # mixed-depth tree and is prefix-closed at every cut.
+    tree_size = getattr(args, "tree_size", None)
+    if tree_size is not None:
+        max_nodes = len(choices) + 1
+        if tree_size < 2:
+            raise ValueError("--tree-size counts nodes including the free root; minimum is 2.")
+        if tree_size > max_nodes:
+            raise ValueError(f"--tree-size {tree_size} exceeds the preset's {max_nodes} nodes.")
+        choices = choices[: tree_size - 1]
+    return choices
 
 
 def resolve_max_new_tokens(args: argparse.Namespace) -> int:

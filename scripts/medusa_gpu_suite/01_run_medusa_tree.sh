@@ -21,8 +21,11 @@ OFFSET="${OFFSET:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 TOP_K="${TOP_K:-10}"
 CHOICE_PRESET="${CHOICE_PRESET:-official-vicuna-7b}"
+TREE_SIZE="${TREE_SIZE:-}"
 ACCEPTANCE="${ACCEPTANCE:-greedy}"
 HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-10}"
+VERBOSE_TIMING="${VERBOSE_TIMING:-1}"
+STEP_TEXT="${STEP_TEXT:-1}"
 
 mkdir -p "$OUT_DIR"
 
@@ -46,7 +49,16 @@ args=(
   --acceptance "$ACCEPTANCE"
   --heartbeat-seconds "$HEARTBEAT_SECONDS"
   --progress
-  --verbose-timing
 )
+
+if [[ -n "$TREE_SIZE" ]]; then
+  args+=(--tree-size "$TREE_SIZE")
+fi
+if [[ "$VERBOSE_TIMING" == "1" ]]; then
+  args+=(--verbose-timing)
+fi
+if [[ "$STEP_TEXT" != "1" ]]; then
+  args+=(--no-step-text)
+fi
 
 python "${args[@]}"
