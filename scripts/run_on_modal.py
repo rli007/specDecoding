@@ -98,32 +98,45 @@ def run_config(name: str, commands: list[list[str]]) -> str:
 
 
 def medusa_config(
-    tree_size: int, question_file: str, limit: int, max_new_tokens: int, out_dir: str
+    tree_size: int,
+    question_file: str,
+    limit: int,
+    max_new_tokens: int,
+    out_dir: str,
+    acceptance: str = "greedy",
+    temperature: float = 0.0,
 ) -> tuple[str, list[list[str]]]:
-    answers = f"{out_dir}/medusa_tree{tree_size}_answers.jsonl"
-    traces = f"{out_dir}/medusa_tree{tree_size}_answers.traces.jsonl"
+    # Typical acceptance is NOT lossless and NOT comparable to the greedy
+    # baseline; keep its outputs under a distinct name so greedy results
+    # are never overwritten (CLAUDE.md gotcha 5.2).
+    tag = f"medusa_tree{tree_size}" if acceptance == "greedy" else f"medusa_tree{tree_size}_{acceptance}_t{temperature:g}"
+    answers = f"{out_dir}/{tag}_answers.jsonl"
+    traces = f"{out_dir}/{tag}_answers.traces.jsonl"
+    run_cmd = [
+        "python", "tools/run_medusa_mtbench.py",
+        "--question-file", question_file,
+        "--answers-jsonl", answers,
+        "--trace-jsonl", traces,
+        "--model-id", f"first-principles-medusa-vicuna-7b-v1.3-{tag}",
+        "--tree-size", str(tree_size),
+        "--limit", str(limit),
+        "--max-new-tokens", str(max_new_tokens),
+        "--device", "cuda",
+        "--dtype", "float16",
+        "--attn-implementation", "eager",  # tree mask must be honored verbatim
+        "--no-step-text",
+        "--progress",
+    ]
+    if acceptance != "greedy":
+        run_cmd += ["--acceptance", acceptance, "--temperature", str(temperature)]
     return (
-        f"medusa_tree{tree_size}",
+        tag,
         [
-            [
-                "python", "tools/run_medusa_mtbench.py",
-                "--question-file", question_file,
-                "--answers-jsonl", answers,
-                "--trace-jsonl", traces,
-                "--model-id", f"first-principles-medusa-vicuna-7b-v1.3-tree{tree_size}",
-                "--tree-size", str(tree_size),
-                "--limit", str(limit),
-                "--max-new-tokens", str(max_new_tokens),
-                "--device", "cuda",
-                "--dtype", "float16",
-                "--attn-implementation", "eager",  # tree mask must be honored verbatim
-                "--no-step-text",
-                "--progress",
-            ],
+            run_cmd,
             [
                 "python", "tools/export_component_log.py", traces,
-                "--method", f"medusa-vicuna-7b-tree{tree_size}",
-                "--out", f"{out_dir}/medusa_tree{tree_size}",
+                "--method", f"medusa-vicuna-7b-{tag}",
+                "--out", f"{out_dir}/{tag}",
             ],
         ],
     )
@@ -190,7 +203,16 @@ def main(
     limit: int = 0,
     max_new_tokens: int = 512,
     parallel: bool = False,
+    typical_temperature: float = 0.7,
 ):
+    """Suite = Medusa (greedy) at each tree size, greedy baseline, assisted k=5,
+    plus Medusa with typical acceptance at each tree size when
+    typical_temperature > 0 (default 0.7; pass --typical-temperature 0 to skip).
+    Typical runs are lossy and land in separate *_typical_t* files; greedy runs
+    are the lossless, baseline-comparable ones."""
+    if typical_temperature < 0:
+        raise ValueError("--typical-temperature must be >= 0 (0 disables typical runs).")
+
     if stage == "smoke":
         question_file, limit, max_new_tokens = MINI_QUESTIONS, 1, 32
         out_dir = f"{RESULTS_DIR}/smoke"
@@ -202,7 +224,15 @@ def main(
     else:
         raise ValueError("stage must be 'smoke' or 'full'")
 
-    configs = [medusa_config(size, question_file, limit, max_new_tokens, out_dir) for size in sizes]
+    configs = [
+        medusa_config(size, question_file, limit, max_new_tokens, out_dir)
+        for size in sizes
+    ]
+    if typical_temperature > 0:
+        configs += [
+            medusa_config(size, question_file, limit, max_new_tokens, out_dir, "typical", typical_temperature)
+            for size in sizes
+        ]
     configs.append(baseline_config(question_file, limit, max_new_tokens, out_dir))
     configs.append(assisted_config(question_file, limit, max_new_tokens, out_dir))
 

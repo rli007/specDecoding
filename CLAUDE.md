@@ -648,3 +648,83 @@ the real branch becomes load-bearing.
   numerator of the speedup equation and have no backup; consider un-ignoring
   them or copying them somewhere durable.
 - Batch size 1 throughout. Target and assistant assumed to share a tokenizer.
+
+---
+
+## 10. 2026-08-05 update: run-count pipeline, Modal GPU infra, voyager refresh
+
+### Repo changes (UNCOMMITTED as of writing — commit before the next big run)
+
+- **Voyager clone updated** `946a222` → `900be4f` (= origin/main, now a `src/`
+  layout; a local `main` branch tracks origin so plain `git pull` works).
+  Import fixes applied here (`voyager_compiler.hardware` →
+  `hardware_config` in `tools/voyager_common.py` + both milestone scripts).
+  **Still broken: `transform()` API drift** — upstream threads one
+  `AcceleratorConfig` through `get_transform_args()` (`test` utils); the
+  milestone scripts fail at their `transform(...)` call until realigned.
+  Upstream cost model also changed (per-tile launch charges, GEMM tile
+  repricing): **all recorded sweep numbers (incl. N\*≈65) are stale** — re-run
+  before quoting.
+- **Bandwidth assumption is now 64 GB/s** (`SPHINX_DRAM_BANDWIDTH_GBS` in
+  `tools/voyager_common.py`; was 68 — all §6/§7 prose figures above used 68).
+- **New run-count pipeline** (per-component invocation logging for the
+  run-counts × per-run-latency cost model). One CSV schema for all methods:
+  `*.components.csv` = one row per model forward, in order
+  (`component, input_positions, cache_len_before`); `*.steps.csv` = one row
+  per decode step with the component sequence + acceptance.
+  - `tools/run_assisted_mtbench.py` — draft-model MT-Bench runner
+    (Vicuna-7B + `JackFram/llama-160m`, k=5 `--assistant-schedule constant`,
+    greedy). Mirrors ISSCC 2026 paper 31.1's setup (LLaMA2-7B + 160M draft on
+    MT-Bench). Its `target_cache_rebuild` and full-sequence `draft_prefill`
+    rows are implementation artifacts (HF crops caches instead) — EXCLUDE
+    from hardware costing.
+  - `tools/export_component_log.py` — converts Medusa/baseline traces.jsonl
+    into the same two CSVs.
+  - `decoders/stripped_down_llama_assisted_decoder.py` gained
+    `--assistant-schedule constant|heuristic` (default heuristic = HF dynamic
+    budget, unchanged behavior).
+  - All three MT-Bench runners now write `<answers stem>.run_config.json`
+    (full CLI args + argv, for provenance).
+- **Smoke validation (Modal A10G, 1 q × 32 tok):** Medusa tree-64
+  2.00 tok/step; assisted k=5 1.78 tok/step (0.78/5 drafts accepted);
+  baseline 1.00. GPU τ and generated text char-identical to the July MPS
+  runs (greedy device-independence confirmed empirically). Note ISSCC 31.8
+  (Tsinghua) drafts a *tree* (top-k per draft step), not a chain — its
+  numbers are not directly comparable to HF-style assisted decoding.
+
+### Modal GPU infrastructure (account `ryan10035869`)
+
+Serverless GPU rental; per-second billing (smoke ≈ 3 min ≈ 5¢; A10G
+≈ $1.10/h). Objects that exist on Modal:
+
+- `scripts/run_on_modal.py` — the harness. Each config = its own GPU job.
+- volume `specdecoding-hf-cache` — model weights, downloaded once, reused.
+- volume `specdecoding-results` — ALL run outputs. **Runs write here, not to
+  the laptop; nothing downloads automatically; same-config reruns
+  truncate + overwrite these cloud files** (typical-acceptance runs use
+  distinct `*_typical_t*` names so greedy/typical never collide). Habit:
+  run → download → only then rerun.
+- secret `huggingface` — HF_TOKEN, so containers can fetch gated Vicuna.
+
+Commands:
+
+```bash
+modal run scripts/run_on_modal.py --stage smoke        # 4 configs, ~5¢ sanity pass
+modal run scripts/run_on_modal.py --stage full --parallel
+    # 12 configs: Medusa greedy+typical(t=0.7) x {64,32,16,8,4}, baseline,
+    # assisted k=5. --typical-temperature 0 skips typical; --tree-sizes,
+    # --limit, --max-new-tokens override; SUITE_GPU=L4 switches GPU type.
+modal volume ls specdecoding-results /                 # what's on the volume
+modal volume get specdecoding-results gpu_suite_full run_logs/modal_full_$(date +%m%d)/
+    # MANUAL results download. Always use a FRESH destination dir —
+    # downloading onto an existing path once produced nested "smoke 8/5/" dirs.
+modal app list                                         # anything still running? (cost check)
+modal app stop <app-id>                                # kill a runaway run
+modal app logs <app-id>                                # re-attach to a run's logs
+modal secret list && modal volume list                 # inventory
+```
+
+`--parallel` costs the same total GPU-seconds, just finishes ~N× sooner.
+Greedy runs are the lossless, paper-claim numbers; typical runs are the lossy
+upside curve (sampling → not reproducible run-to-run; quote averages, pair
+with a judge score before publishing).

@@ -286,6 +286,15 @@ def summarize_trace(trace_steps: list[MedusaStepTrace], generated_token_count: i
     }
 
 
+def write_run_config(answer_path: Path, args: argparse.Namespace) -> Path:
+    """Sidecar JSON with every CLI setting, so each result set is self-describing."""
+    config_path = answer_path.with_name(f"{answer_path.stem}.run_config.json")
+    payload = {"argv": sys.argv, "args": vars(args), "written_at": time.strftime("%Y-%m-%d %H:%M:%S %Z")}
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
+    return config_path
+
+
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -342,6 +351,7 @@ def main() -> None:
 
     truncate_file(answer_path)
     truncate_file(trace_path)
+    print(f"run config: {write_run_config(answer_path, args)}")
 
     print("\nLoading tokenizer...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)

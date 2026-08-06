@@ -65,6 +65,7 @@ from tools.run_medusa_mtbench import (
     read_questions,
     trim_answer,
     truncate_file,
+    write_run_config,
 )
 
 
@@ -308,6 +309,7 @@ def main() -> None:
     truncate_file(trace_path)
     truncate_file(components_path)
     truncate_file(steps_path)
+    print(f"run config: {write_run_config(answer_path, args)}")
 
     print("\nLoading tokenizer...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
