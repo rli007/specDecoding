@@ -756,14 +756,40 @@ Vicuna-7B; no deadline pressure.
   output token-identical to plain greedy, 2.00 tok/step signature (free root
   + correction) ✓; (b) `--real-load` checkpoint mapping ✓.
 
-**Remaining:** (1) fast tree verification — current shell verifies each path
-with separate full-sequence target forwards (fine for tiny smoke, unusable at
-MT-Bench scale); reuse the Medusa tree-mask forward + KV machinery.
-(2) `tools/run_eagle_mtbench.py` + component-CSV entries (eagle_draft_step /
-tree_target_forward). (3) Modal PAIRS/config + τ validation vs paper.
-(4) Compile the drafter through Voyager — it is ONE decoder layer, so the
-multi-layer export bug does NOT block it; EAGLE can be the first method with
-a fully measured drafting cost.
+**DONE 2026-08-06 (later session):** fast tree verification
+(`generate_tree_verified`) reusing the Medusa machinery — buffers from
+`generate_medusa_buffers` (node orders provably match: both sort by
+(len, values)), additive tree mask, per-path logit reorder against the
+LEAF-deduped `retrieve_indices` (15 rows, not 25 — candidate rows must be
+built from the tree tensor via retrieve_indices, first integration bug),
+greedy posterior, `_copy_selected_tree_cache`, plus the EAGLE-specific
+FEATURES buffer carry (accepted positions' tree-forward hidden states feed
+the next draft). `tools/run_eagle_mtbench.py` runner with component CSVs
+(eagle_draft_warmup = artifact/exclude; eagle_draft_step frontiers 4,8,8,3,2;
+tree_target_forward 26; kv_cache_gather). Modal: `eagle_drafter` pair field +
+`eagle_config`; also added a generic `--only <config,...>` filter to the
+harness. Losslessness verified at every level: tiny models (both verifiers ==
+plain greedy), real Vicuna-7B on GPU (char-identical to baseline), cache
+surgery green on transformers 5.13 (local) and 5.6.2 (Modal).
+
+**Measured (20q x 512 tok, `gpu_suite_limit20/eagle1_*`): 3.119 tokens/step
+(τ=2.119)** — best lossless method (Medusa tree-64: 2.40, assisted 160M:
+2.51). BELOW the EAGLE-1 paper's ~3.9 for Vicuna-7B (~80%). Hypotheses, in
+check order: paper may use a larger tree than the repo's current
+mc_sim_7b_63 (25 paths — the "63" name suggests the original had 63 nodes);
+generation length 512 vs 1024 + 20 vs 80 questions; or a subtle drafting
+convention (fc cat order emb-first taken from upstream, position-id
+convention). A differential run vs official EAGLE code is the way to close
+it if the gap matters.
+
+**Remaining:** (1) compile the drafter through Voyager — ONE decoder layer,
+NOT blocked by the multi-layer export bug → EAGLE can be the first method
+with a measured drafting cost. Note for the cost model: each of the 5 draft
+depths also streams the 76 MB lm_head (~380 MB/step of head traffic alone) —
+EAGLE's hidden tax on memory-bound hardware, quantifiable via §6(b)-style
+head quantization. (2) Optional differential vs official EAGLE to close the
+τ gap. (3) Roofline sketch: tree ~1.08x + drafting ~0.29x → step ~1.37x →
+**~2.3x predicted speedup**, edging Medusa's 2.10.
 
 ### Modal GPU infrastructure (account `ryan10035869`)
 

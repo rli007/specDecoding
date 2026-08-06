@@ -63,6 +63,8 @@ PAIRS = {
         "assisted_id_prefix": "stripped-assisted-vicuna-7b-llama-160m",
         "medusa_id_prefix": "first-principles-medusa-vicuna-7b-v1.3",
         "medusa_method_prefix": "medusa-vicuna-7b",
+        "eagle_drafter": "yuhuili/EAGLE-Vicuna-7B-v1.3",
+        "eagle_id": "first-principles-eagle1-vicuna-7b-v1.3",
     },
     "llama31": {
         "target": "meta-llama/Meta-Llama-3.1-8B",
@@ -75,6 +77,8 @@ PAIRS = {
         "assisted_id_prefix": "stripped-assisted-llama-3.1-8b-llama-3.2-1b",
         "medusa_id_prefix": "first-principles-medusa-llama-3.1-8b",
         "medusa_method_prefix": "medusa-llama-3.1-8b",
+        "eagle_drafter": None,  # published EAGLE weights target the Instruct variant
+        "eagle_id": None,
     },
 }
 
@@ -243,6 +247,31 @@ def assisted_config(
     )
 
 
+def eagle_config(
+    pair: dict, question_file: str, limit: int, max_new_tokens: int, out_dir: str
+) -> tuple[str, list[list[str]]]:
+    # The EAGLE runner writes its component/step CSVs itself.
+    return (
+        "eagle1",
+        [
+            [
+                "python", "tools/run_eagle_mtbench.py",
+                "--question-file", question_file,
+                "--answers-jsonl", f"{out_dir}/eagle1_answers.jsonl",
+                "--model-id", pair["eagle_id"],
+                "--target-model", pair["target"],
+                "--eagle-drafter", pair["eagle_drafter"],
+                *pair_flags(pair),
+                "--limit", str(limit),
+                "--max-new-tokens", str(max_new_tokens),
+                "--device", "cuda",
+                "--dtype", "float16",
+                "--no-step-text",
+            ],
+        ],
+    )
+
+
 @app.local_entrypoint()
 def main(
     stage: str = "smoke",
@@ -252,6 +281,7 @@ def main(
     parallel: bool = False,
     typical_temperature: float = 0.7,
     pair: str = "vicuna7b",
+    only: str = "",
 ):
     """Suite = Medusa (greedy) at each tree size, greedy baseline, assisted k=5,
     plus Medusa with typical acceptance at each tree size when
@@ -292,8 +322,17 @@ def main(
             ]
     else:
         print(f"pair {pair} has no public Medusa heads: running baseline + assisted only")
+    if pair_spec.get("eagle_drafter"):
+        configs.append(eagle_config(pair_spec, question_file, limit, max_new_tokens, out_dir))
     configs.append(baseline_config(pair_spec, question_file, limit, max_new_tokens, out_dir))
     configs.append(assisted_config(pair_spec, question_file, limit, max_new_tokens, out_dir))
+
+    if only:
+        wanted = {part.strip() for part in only.split(",") if part.strip()}
+        unknown = wanted - {name for name, _ in configs}
+        if unknown:
+            raise ValueError(f"--only names not in this suite: {sorted(unknown)}")
+        configs = [(name, commands) for name, commands in configs if name in wanted]
 
     print(f"stage={stage} pair={pair} gpu={GPU_KIND} configs={[name for name, _ in configs]}")
     if parallel:

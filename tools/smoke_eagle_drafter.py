@@ -69,27 +69,29 @@ def mechanism_test() -> None:
     max_new_tokens = 12
 
     reference = plain_greedy(target, prompt, max_new_tokens)
-    output, trace = generate_with_trace(
-        target,
-        drafter,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=None,
-    )
-
-    assert output.shape[-1] == reference.shape[-1], (
-        f"length mismatch: eagle {output.shape[-1]} vs greedy {reference.shape[-1]}"
-    )
-    assert torch.equal(output, reference), (
-        f"LOSSLESSNESS VIOLATED:\n eagle  {output[0].tolist()}\n greedy {reference[0].tolist()}"
-    )
-    appended = sum(len(step.appended_tokens) for step in trace)
-    print(
-        f"mechanism: ok — {len(trace)} steps, {appended} tokens, "
-        f"{appended / len(trace):.2f} tokens/step (random drafter), output == plain greedy"
-    )
-    for step in trace[:1]:
-        print(f"  step 1 drafter metadata: {step.drafter_metadata}")
+    for verifier in ("slow", "tree"):
+        output, trace = generate_with_trace(
+            target,
+            drafter,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=None,
+            verifier=verifier,
+        )
+        assert output.shape[-1] == reference.shape[-1], (
+            f"[{verifier}] length mismatch: eagle {output.shape[-1]} vs greedy {reference.shape[-1]}"
+        )
+        assert torch.equal(output, reference), (
+            f"[{verifier}] LOSSLESSNESS VIOLATED:\n eagle  {output[0].tolist()}\n greedy {reference[0].tolist()}"
+        )
+        appended = sum(len(step.appended_tokens) for step in trace)
+        print(
+            f"mechanism [{verifier}]: ok — {len(trace)} steps, {appended} tokens, "
+            f"{appended / len(trace):.2f} tokens/step (random drafter), output == plain greedy"
+        )
+        if verifier == "tree":
+            updated = all(step.drafter_metadata.get("cache_updated") for step in trace)
+            print(f"  tree cache surgery used on every step: {updated}")
 
 
 def real_load_test() -> None:

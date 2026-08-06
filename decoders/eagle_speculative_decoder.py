@@ -318,6 +318,11 @@ class EagleOneDrafter:
             metadata={
                 "drafter": "eagle1-static-tree",
                 "tree_nodes_incl_root": len(nodes) + 1,
+                # Node tokens in the canonical (len, values)-sorted order —
+                # the same order generate_medusa_buffers uses, so the fast
+                # verifier can build its tree tensor directly from this list.
+                "node_tokens": [node.token for node in nodes],
+                "root_token": root_token,
                 "draft_forward_positions": [n_pairs] + [
                     sum(1 for node in nodes if node.depth == d)
                     for d in range(1, max(node.depth for node in nodes) + 1)
@@ -540,6 +545,167 @@ def verify_candidate_paths_slow(
     return best
 
 
+def generate_tree_verified(
+    target_model: torch.nn.Module,
+    eagle_drafter: "EagleOneDrafter",
+    prompt_token_ids: torch.Tensor,
+    max_new_tokens: int,
+    min_length: int = 0,
+    eos_token_id: int | Iterable[int] | torch.Tensor | None = None,
+    trace_steps: list[EagleStepTrace] | None = None,
+    top_k_logits: int = 0,
+    progress: bool = False,
+    heartbeat_seconds: float = 0.0,
+) -> torch.Tensor:
+    """EAGLE-1 generation with fast tree verification.
+
+    One target forward per step over the whole draft tree (root + 25 nodes for
+    the default choices), using the Medusa tree machinery: the same additive
+    tree attention mask, depth-based position ids, per-path logit reordering,
+    greedy posterior, and KV select-and-compact. The EAGLE-specific carry is
+    the FEATURES buffer: the accepted positions' hidden states from the tree
+    forward are appended each step, because they are exactly what the drafter
+    consumes next step. State logits at the last accepted position become the
+    next free root, so no re-prefill is ever needed while cache surgery works.
+    """
+    from decoders.medusa_speculative_decoder import (
+        _additive_tree_attention_mask,
+        _copy_selected_tree_cache,
+        _reorder_tree_logits,
+        _safe_retrieve_indices,
+        evaluate_posterior,
+        forward_target_with_hidden_cache,
+        generate_medusa_buffers,
+    )
+
+    validate_generate_inputs(prompt_token_ids, max_new_tokens, num_assistant_tokens=1)
+    if max_new_tokens == 0:
+        return prompt_token_ids
+
+    device = model_device(target_model, prompt_token_ids)
+    generated = prompt_token_ids.to(device).clone()
+    eos_token_ids = normalize_eos_token_ids(target_model, eos_token_id)
+    prompt_length = generated.shape[-1]
+
+    choices = eagle_drafter.choices
+    buffers = generate_medusa_buffers(choices, top_k=max(max(path) for path in choices) + 1, device=device)
+    tree_len = len(buffers.choices) + 1
+    dtype = next(target_model.parameters()).dtype
+
+    def full_prefill(ids: torch.Tensor):
+        logits, hidden, cache = forward_target_with_hidden_cache(
+            target_model, ids, use_cache=True, strict_kwargs=True
+        )
+        return logits[:, -1:, :], hidden, cache
+
+    with torch.inference_mode():
+        state_logits, features, past_key_values = full_prefill(generated)
+        step = 1
+        while generated.shape[-1] - prompt_length < max_new_tokens:
+            if should_stop(generated, eos_token_ids, min_length):
+                break
+
+            prefix_length = generated.shape[-1]
+            remaining = max_new_tokens - (prefix_length - prompt_length)
+
+            draft_tree = propose_eagle_tree(
+                eagle_drafter,
+                generated,
+                features,
+                state_logits,
+                max_depth=0,
+                top_k=0,
+                max_paths=0,
+            )
+            node_tokens = draft_tree.metadata["node_tokens"]
+            root_token = draft_tree.metadata["root_token"]
+            tree_candidates = torch.tensor(
+                [[root_token, *node_tokens]], dtype=generated.dtype, device=device
+            )
+            if tree_candidates.shape[-1] != tree_len:
+                raise RuntimeError("drafter node count does not match tree buffers")
+
+            # Per-path candidate rows aligned with retrieve_indices (leaf paths
+            # only, prefix-deduped) — the same construction Medusa uses, so
+            # rows match path_logits one-to-one.
+            extended = torch.cat(
+                [tree_candidates[0], torch.tensor([-1], dtype=generated.dtype, device=device)]
+            )
+            candidate_paths = extended[_safe_retrieve_indices(buffers.retrieve_indices, tree_len)]
+
+            attention_mask = _additive_tree_attention_mask(prefix_length, buffers, dtype=dtype, device=device)
+            position_ids = (buffers.position_ids + prefix_length).unsqueeze(0).to(device)
+            tree_logits, tree_hidden, next_cache = forward_target_with_hidden_cache(
+                target_model,
+                tree_candidates,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                strict_kwargs=True,
+            )
+
+            path_logits = _reorder_tree_logits(tree_logits, buffers.retrieve_indices)
+            best_index, accepted_future = evaluate_posterior(
+                path_logits, candidate_paths, acceptance_mode="greedy"
+            )
+
+            path_length = int((candidate_paths[best_index] >= 0).sum().item())
+            append_count = min(min(path_length, accepted_future + 1), remaining)
+            appended = candidate_paths[best_index, :append_count].unsqueeze(0).to(device=device, dtype=generated.dtype)
+            selected_tree_indices = buffers.retrieve_indices[best_index, :append_count]
+
+            generated = torch.cat([generated, appended], dim=-1)
+            accepted_features = tree_hidden[:, selected_tree_indices, :]
+            features = torch.cat([features, accepted_features], dim=1)
+            last_state_index = max(append_count - 1, 0)
+            state_logits = path_logits[best_index, last_state_index : last_state_index + 1, :].unsqueeze(0)
+
+            cache_updated = _copy_selected_tree_cache(next_cache, prefix_length, selected_tree_indices)
+            fallback_reason = None
+            if cache_updated:
+                past_key_values = next_cache
+            else:
+                # Unfamiliar cache layout: rebuild everything from scratch
+                # rather than risk corrupt state (mirrors the Medusa decoder).
+                fallback_reason = "cache_copy_unsupported"
+                state_logits, features, past_key_values = full_prefill(generated)
+
+            if trace_steps is not None:
+                trace_steps.append(
+                    EagleStepTrace(
+                        step=step,
+                        prefix_length=prefix_length,
+                        remaining_new_tokens=remaining,
+                        candidate_path_count=candidate_paths.shape[0],
+                        selected_path_index=best_index,
+                        selected_path_tokens=candidate_paths[best_index, :path_length].tolist(),
+                        target_predictions=torch.argmax(path_logits[best_index, :path_length, :], dim=-1).tolist(),
+                        target_top_logits=[],
+                        accepted_count=append_count,
+                        rejected_at=append_count if append_count < path_length else None,
+                        appended_tokens=appended[0].tolist(),
+                        output_length=generated.shape[-1],
+                        stop_reason=stop_reason_for(generated, prompt_length, max_new_tokens, eos_token_ids, min_length),
+                        drafter_metadata={
+                            **draft_tree.metadata,
+                            "verification_method": "tree",
+                            "cache_updated": cache_updated,
+                            "fallback_reason": fallback_reason,
+                        },
+                    )
+                )
+            if progress:
+                print(
+                    f"[eagle step {step}] tree verify nodes={tree_len} best_path={best_index} "
+                    f"accepted={append_count} appended={appended[0].tolist()}",
+                    flush=True,
+                )
+            step += 1
+
+    return generated
+
+
 def generate(
     target_model: torch.nn.Module,
     eagle_drafter: Any,
@@ -555,7 +721,7 @@ def generate(
     progress: bool = False,
     heartbeat_seconds: float = 0.0,
 ) -> torch.Tensor:
-    """Generate with an EAGLE-style hidden-state drafter."""
+    """Generate with an EAGLE-style hidden-state drafter (slow path verifier)."""
     validate_generate_inputs(prompt_token_ids, max_new_tokens, num_assistant_tokens=max_depth)
     if max_new_tokens == 0:
         return prompt_token_ids
@@ -648,21 +814,38 @@ def generate_with_trace(
     top_k_logits: int = 0,
     progress: bool = False,
     heartbeat_seconds: float = 0.0,
+    verifier: str = "slow",
 ) -> tuple[torch.Tensor, list[EagleStepTrace]]:
     trace_steps: list[EagleStepTrace] = []
-    output_ids = generate(
-        target_model,
-        eagle_drafter,
-        prompt_token_ids,
-        max_new_tokens=max_new_tokens,
-        min_length=min_length,
-        eos_token_id=eos_token_id,
-        max_depth=max_depth,
-        top_k=top_k,
-        max_paths=max_paths,
-        trace_steps=trace_steps,
-        top_k_logits=top_k_logits,
-        progress=progress,
-        heartbeat_seconds=heartbeat_seconds,
-    )
+    if verifier == "tree":
+        output_ids = generate_tree_verified(
+            target_model,
+            eagle_drafter,
+            prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            min_length=min_length,
+            eos_token_id=eos_token_id,
+            trace_steps=trace_steps,
+            top_k_logits=top_k_logits,
+            progress=progress,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    elif verifier == "slow":
+        output_ids = generate(
+            target_model,
+            eagle_drafter,
+            prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            min_length=min_length,
+            eos_token_id=eos_token_id,
+            max_depth=max_depth,
+            top_k=top_k,
+            max_paths=max_paths,
+            trace_steps=trace_steps,
+            top_k_logits=top_k_logits,
+            progress=progress,
+            heartbeat_seconds=heartbeat_seconds,
+        )
+    else:
+        raise ValueError("verifier must be 'tree' or 'slow'")
     return output_ids, trace_steps
