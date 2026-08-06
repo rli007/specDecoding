@@ -48,7 +48,7 @@ from voyager_compiler import (
 )
 from voyager_compiler import compile as voyager_compile
 from voyager_compiler.codegen.reporting import report
-from voyager_compiler.hardware import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 from decoders.medusa_speculative_decoder import (
     MedusaHeadStack,

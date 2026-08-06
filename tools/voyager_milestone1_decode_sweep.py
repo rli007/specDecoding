@@ -14,7 +14,7 @@ calibrate / convert) -> transform -> compile -> report, and records cycles +
 DRAM traffic. N=1 is the plain-decode baseline; the speedup denominator is
 cycles(N) / cycles(1).
 
-Defaults are the Sphinx configuration (64x64 PE array, 1 GHz, 68 GB/s ASSUMED
+Defaults are the Sphinx configuration (64x64 PE array, 1 GHz, 64 GB/s ASSUMED
 bandwidth, 2.5 MB scratchpad, double-buffered L2, nf4_6 mixed precision) and a
 SINGLE decoder layer + lm_head (~1/32 of the model) so it fits in laptop RAM.
 Pass --full_model on a big machine for true totals; the knee's position in N
@@ -68,7 +68,7 @@ from voyager_compiler.codegen import (
     replace_rmsnorm_with_layer_norm,
 )
 from voyager_compiler.codegen.reporting import report
-from voyager_compiler.hardware import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 from tools.voyager_common import (
     DEFAULT_VOYAGER_ROOT,

@@ -21,16 +21,17 @@ import torch
 
 from voyager_compiler import OpMatcher
 from voyager_compiler.codegen.node_info import is_fully_connected
-from voyager_compiler.hardware import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 DEFAULT_VOYAGER_ROOT = Path.home() / "Desktop" / "voyager" / "voyager-compiler"
 
 SPHINX_PE_ARRAY = (64, 64)  # 64x64 systolic Matrix Unit
 SPHINX_FREQUENCY_GHZ = 1.0
-# ASSUMED mobile LPDDR5 number, not a measured one. N* scales as 1/bandwidth,
-# so this is the single knob most likely to move the conclusion — confirm the
-# real target with the mentor before quoting any N* (NOTES_FOR_MENTOR.md Q1).
-SPHINX_DRAM_BANDWIDTH_GBS = 68.0
+# Working assumption (2026-08-05), not a measured number. N* scales as
+# 1/bandwidth, so this is the single knob most likely to move the conclusion —
+# confirm the real target with the mentor before quoting any N*
+# (NOTES_FOR_MENTOR.md Q1). Runs before 2026-08-05 used 68.0.
+SPHINX_DRAM_BANDWIDTH_GBS = 64.0
 # Slide 42: 2.5 MB on-chip scratchpad. AcceleratorConfig documents
 # scratchpad_size as the PER-BUFFER budget under double buffering, while the
 # --cache_size CLI help says "total L2"; the two docstrings disagree. We pass

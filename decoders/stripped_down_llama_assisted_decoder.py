@@ -378,6 +378,9 @@ def update_candidate_strategy(state: CandidateState, candidate_length: int, n_ma
         state.num_assistant_tokens = max(1, state.num_assistant_tokens - 1)
 
 
+ASSISTANT_SCHEDULES = ("heuristic", "constant")
+
+
 def assisted_generate(
     target_model: torch.nn.Module,
     assistant_model: torch.nn.Module,
@@ -386,6 +389,7 @@ def assisted_generate(
     min_length: int = 0,
     eos_token_id: int | Iterable[int] | torch.Tensor | None = None,
     num_assistant_tokens: int = DEFAULT_NUM_ASSISTANT_TOKENS,
+    assistant_schedule: str = "heuristic",
     mode: str = "greedy",
     top_k_probs: int = 0,
     verbose: bool = True,
@@ -399,6 +403,8 @@ def assisted_generate(
         raise ValueError("max_new_tokens must be non-negative.")
     if mode not in {"greedy", "sampling"}:
         raise ValueError("mode must be 'greedy' or 'sampling'.")
+    if assistant_schedule not in ASSISTANT_SCHEDULES:
+        raise ValueError(f"assistant_schedule must be one of {ASSISTANT_SCHEDULES}.")
     if max_new_tokens == 0:
         return prompt_token_ids
 
@@ -465,7 +471,8 @@ def assisted_generate(
             valid_tokens = valid_tokens[:, :remaining]
             generated = torch.cat([generated, valid_tokens.to(generated.device)], dim=-1)
 
-            update_candidate_strategy(candidate_state, candidate_length, n_matches)
+            if assistant_schedule == "heuristic":
+                update_candidate_strategy(candidate_state, candidate_length, n_matches)
             step_trace = AssistedStepTrace(
                 step=step,
                 mode=mode,
@@ -515,6 +522,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--num-assistant-tokens", type=int, default=DEFAULT_NUM_ASSISTANT_TOKENS)
+    parser.add_argument(
+        "--assistant-schedule",
+        choices=ASSISTANT_SCHEDULES,
+        default="heuristic",
+        help="heuristic mirrors HF's dynamic budget (+2 on full match, -1 otherwise); constant keeps k fixed.",
+    )
     parser.add_argument("--mode", choices=("greedy", "sampling"), default="greedy")
     parser.add_argument("--top-k-probs", type=int, default=0)
     parser.add_argument("--min-length", type=int, default=0)
@@ -560,6 +573,7 @@ def main() -> None:
         min_length=args.min_length,
         eos_token_id=tokenizer.eos_token_id,
         num_assistant_tokens=args.num_assistant_tokens,
+        assistant_schedule=args.assistant_schedule,
         mode=args.mode,
         top_k_probs=args.top_k_probs,
         verbose=not args.quiet,
