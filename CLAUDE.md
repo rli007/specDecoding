@@ -734,6 +734,37 @@ until the draft model compiles.** Assisted acceptance at real lengths (2.51)
 beats Medusa tree-64 (2.40): the smoke run's short-generation bias had
 hidden this.
 
+### EAGLE-1 implementation (started 2026-08-06, in progress)
+
+Decisions (Ryan): EAGLE-1 static tree only (EAGLE-2's dynamic tree deferred);
+validation bar = greedy losslessness + measured τ near the paper's ~3.5-4 for
+Vicuna-7B; no deadline pressure.
+
+**Done + verified:**
+- `EagleDrafterModel` + `load_official_eagle_drafter` in
+  `eagle_speculative_decoder.py` — faithful to `yuhuili/EAGLE-Vicuna-7B-v1.3`
+  (own embed copy; fc 8192→4096 with bias fusing cat(embedding, feature);
+  ONE LlamaDecoderLayer with input_layernorm REMOVED; no final norm; lm_head
+  shared from target). Loader hard-fails on any unmapped weight. 367M params.
+- `EAGLE_MC_SIM_7B_63_CHOICES` vendored (paper default: 25 paths, depth 5,
+  26 verify nodes incl. free root; same rank-tuple format as Medusa presets).
+- `EagleOneDrafter.propose_tree` — static-tree drafting: warm drafter cache
+  over (feature_i, token_{i+1}) pairs + root pair, then depth-by-depth
+  frontier expansion with tree attention (DynamicCache; drafter cache rebuilt
+  per step, inspectability choice — charge algorithmic work only).
+- `tools/smoke_eagle_drafter.py`: (a) losslessness with a RANDOM drafter —
+  output token-identical to plain greedy, 2.00 tok/step signature (free root
+  + correction) ✓; (b) `--real-load` checkpoint mapping ✓.
+
+**Remaining:** (1) fast tree verification — current shell verifies each path
+with separate full-sequence target forwards (fine for tiny smoke, unusable at
+MT-Bench scale); reuse the Medusa tree-mask forward + KV machinery.
+(2) `tools/run_eagle_mtbench.py` + component-CSV entries (eagle_draft_step /
+tree_target_forward). (3) Modal PAIRS/config + τ validation vs paper.
+(4) Compile the drafter through Voyager — it is ONE decoder layer, so the
+multi-layer export bug does NOT block it; EAGLE can be the first method with
+a fully measured drafting cost.
+
 ### Modal GPU infrastructure (account `ryan10035869`)
 
 Serverless GPU rental; per-second billing (smoke ≈ 3 min ≈ 5¢; A10G
