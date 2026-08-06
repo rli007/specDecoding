@@ -159,6 +159,22 @@ def get_llama_qconfig(bs=64, outlier_pct=None):
         }
 
 
+def sphinx_transform_args(args, patterns) -> dict:
+    """Build transform() kwargs the way upstream now does.
+
+    Mirrors voyager-compiler test/utils/models/utils.py get_transform_args
+    (post-restructure API): all hardware parameters travel in one
+    AcceleratorConfig; layout choices are strings from add_compile_args.
+    """
+    return {
+        "patterns": patterns,
+        "config": AcceleratorConfig.from_args(args),
+        "layout_policy": args.layout_policy,
+        "gemv_weight_layout": args.gemv_weight_layout,
+        "fuse_reshape": not args.disable_reshape_fusion,
+    }
+
+
 def load_set_qconfig(voyager_root: str | Path):
     """Import set_qconfig from the voyager clone's examples/, like upstream does.
 

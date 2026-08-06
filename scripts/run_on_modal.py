@@ -48,6 +48,44 @@ QUESTION_URL = (
     "fastchat/llm_judge/data/mt_bench/question.jsonl"
 )
 
+# Model pairs. A --pair flag SELECTS one per run; results land in a per-pair
+# folder so pairs can never overwrite each other. heads=None means no public
+# Medusa heads exist for that family -> medusa/typical configs are skipped.
+PAIRS = {
+    "vicuna7b": {
+        "target": "lmsys/vicuna-7b-v1.3",
+        "draft": "JackFram/llama-160m",
+        "heads": "FasterDecoding/medusa-vicuna-7b-v1.3",
+        "prompt_style": "vicuna",
+        "stop": [],  # runner defaults already trim USER:/ASSISTANT:
+        "baseline_id": "vicuna-7b-v1.3-greedy-baseline",
+        "baseline_method": "vicuna-7b-baseline",
+        "assisted_id_prefix": "stripped-assisted-vicuna-7b-llama-160m",
+        "medusa_id_prefix": "first-principles-medusa-vicuna-7b-v1.3",
+        "medusa_method_prefix": "medusa-vicuna-7b",
+    },
+    "llama31": {
+        "target": "meta-llama/Meta-Llama-3.1-8B",
+        "draft": "meta-llama/Llama-3.2-1B",
+        "heads": None,
+        "prompt_style": "plain",
+        "stop": ["User:", "Assistant:"],
+        "baseline_id": "llama-3.1-8b-greedy-baseline",
+        "baseline_method": "llama-3.1-8b-baseline",
+        "assisted_id_prefix": "stripped-assisted-llama-3.1-8b-llama-3.2-1b",
+        "medusa_id_prefix": "first-principles-medusa-llama-3.1-8b",
+        "medusa_method_prefix": "medusa-llama-3.1-8b",
+    },
+}
+
+
+def pair_flags(pair: dict) -> list[str]:
+    flags = ["--prompt-style", pair["prompt_style"]]
+    for stop in pair["stop"]:
+        flags += ["--stop-string", stop]
+    return flags
+
+
 app = modal.App("specdecoding-suite")
 
 image = (
@@ -98,6 +136,7 @@ def run_config(name: str, commands: list[list[str]]) -> str:
 
 
 def medusa_config(
+    pair: dict,
     tree_size: int,
     question_file: str,
     limit: int,
@@ -117,7 +156,10 @@ def medusa_config(
         "--question-file", question_file,
         "--answers-jsonl", answers,
         "--trace-jsonl", traces,
-        "--model-id", f"first-principles-medusa-vicuna-7b-v1.3-{tag}",
+        "--model-id", f"{pair['medusa_id_prefix']}-{tag}",
+        "--base-model", pair["target"],
+        "--medusa-heads", pair["heads"],
+        *pair_flags(pair),
         "--tree-size", str(tree_size),
         "--limit", str(limit),
         "--max-new-tokens", str(max_new_tokens),
@@ -135,7 +177,7 @@ def medusa_config(
             run_cmd,
             [
                 "python", "tools/export_component_log.py", traces,
-                "--method", f"medusa-vicuna-7b-{tag}",
+                "--method", f"{pair['medusa_method_prefix']}-{tag}",
                 "--out", f"{out_dir}/{tag}",
             ],
         ],
@@ -143,7 +185,7 @@ def medusa_config(
 
 
 def baseline_config(
-    question_file: str, limit: int, max_new_tokens: int, out_dir: str
+    pair: dict, question_file: str, limit: int, max_new_tokens: int, out_dir: str
 ) -> tuple[str, list[list[str]]]:
     answers = f"{out_dir}/vicuna_baseline_answers.jsonl"
     traces = f"{out_dir}/vicuna_baseline_answers.traces.jsonl"
@@ -155,7 +197,9 @@ def baseline_config(
                 "--question-file", question_file,
                 "--answers-jsonl", answers,
                 "--trace-jsonl", traces,
-                "--model-id", "vicuna-7b-v1.3-greedy-baseline",
+                "--model-id", pair["baseline_id"],
+                "--base-model", pair["target"],
+                *pair_flags(pair),
                 "--limit", str(limit),
                 "--max-new-tokens", str(max_new_tokens),
                 "--device", "cuda",
@@ -165,7 +209,7 @@ def baseline_config(
             ],
             [
                 "python", "tools/export_component_log.py", traces,
-                "--method", "vicuna-7b-baseline",
+                "--method", pair["baseline_method"],
                 "--out", f"{out_dir}/baseline",
             ],
         ],
@@ -173,7 +217,7 @@ def baseline_config(
 
 
 def assisted_config(
-    question_file: str, limit: int, max_new_tokens: int, out_dir: str, k: int = 5
+    pair: dict, question_file: str, limit: int, max_new_tokens: int, out_dir: str, k: int = 5
 ) -> tuple[str, list[list[str]]]:
     # The assisted runner writes its component/step CSVs itself.
     return (
@@ -183,7 +227,10 @@ def assisted_config(
                 "python", "tools/run_assisted_mtbench.py",
                 "--question-file", question_file,
                 "--answers-jsonl", f"{out_dir}/assisted_k{k}_answers.jsonl",
-                "--model-id", f"stripped-assisted-vicuna-7b-llama-160m-k{k}",
+                "--model-id", f"{pair['assisted_id_prefix']}-k{k}",
+                "--target-model", pair["target"],
+                "--assistant-model", pair["draft"],
+                *pair_flags(pair),
                 "--num-assistant-tokens", str(k),
                 "--assistant-schedule", "constant",
                 "--limit", str(limit),
@@ -201,9 +248,10 @@ def main(
     stage: str = "smoke",
     tree_sizes: str = "64,32,16,8,4",
     limit: int = 0,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 1024,  # canonical MT-Bench / Spec-Bench generation length
     parallel: bool = False,
     typical_temperature: float = 0.7,
+    pair: str = "vicuna7b",
 ):
     """Suite = Medusa (greedy) at each tree size, greedy baseline, assisted k=5,
     plus Medusa with typical acceptance at each tree size when
@@ -212,6 +260,9 @@ def main(
     are the lossless, baseline-comparable ones."""
     if typical_temperature < 0:
         raise ValueError("--typical-temperature must be >= 0 (0 disables typical runs).")
+    if pair not in PAIRS:
+        raise ValueError(f"--pair must be one of {sorted(PAIRS)}")
+    pair_spec = PAIRS[pair]
 
     if stage == "smoke":
         question_file, limit, max_new_tokens = MINI_QUESTIONS, 1, 32
@@ -219,24 +270,32 @@ def main(
         sizes = [64]
     elif stage == "full":
         question_file = FULL_QUESTIONS
-        out_dir = f"{RESULTS_DIR}/gpu_suite_full"
+        # Limited runs get their own folder so a later full run can't overwrite them.
+        out_dir = f"{RESULTS_DIR}/gpu_suite_full" if limit == 0 else f"{RESULTS_DIR}/gpu_suite_limit{limit}"
         sizes = [int(part) for part in tree_sizes.split(",") if part.strip()]
     else:
         raise ValueError("stage must be 'smoke' or 'full'")
 
-    configs = [
-        medusa_config(size, question_file, limit, max_new_tokens, out_dir)
-        for size in sizes
-    ]
-    if typical_temperature > 0:
+    if pair != "vicuna7b":
+        out_dir = f"{out_dir}_{pair}"  # per-pair folder: pairs can never overwrite each other
+
+    configs = []
+    if pair_spec["heads"] is not None:
         configs += [
-            medusa_config(size, question_file, limit, max_new_tokens, out_dir, "typical", typical_temperature)
+            medusa_config(pair_spec, size, question_file, limit, max_new_tokens, out_dir)
             for size in sizes
         ]
-    configs.append(baseline_config(question_file, limit, max_new_tokens, out_dir))
-    configs.append(assisted_config(question_file, limit, max_new_tokens, out_dir))
+        if typical_temperature > 0:
+            configs += [
+                medusa_config(pair_spec, size, question_file, limit, max_new_tokens, out_dir, "typical", typical_temperature)
+                for size in sizes
+            ]
+    else:
+        print(f"pair {pair} has no public Medusa heads: running baseline + assisted only")
+    configs.append(baseline_config(pair_spec, question_file, limit, max_new_tokens, out_dir))
+    configs.append(assisted_config(pair_spec, question_file, limit, max_new_tokens, out_dir))
 
-    print(f"stage={stage} gpu={GPU_KIND} configs={[name for name, _ in configs]}")
+    print(f"stage={stage} pair={pair} gpu={GPU_KIND} configs={[name for name, _ in configs]}")
     if parallel:
         for result in run_config.starmap(configs):
             print(f"done: {result}")

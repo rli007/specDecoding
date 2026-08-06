@@ -78,6 +78,7 @@ from tools.voyager_common import (
     load_set_qconfig,
     print_rows,
     schedule_row,
+    sphinx_transform_args,
     stamp_unplaced_constants_as_dram,
     write_csv,
 )
@@ -112,6 +113,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Quantize the additive mask input to int1, as the reference flow does.",
     )
+    parser.add_argument(
+        "--num_attention_heads",
+        type=int,
+        default=None,
+        help="Repartition attention into this many heads (same projection shapes, "
+        "so same cost). Workaround for small models whose head_dim < 128 trips "
+        "the compiler's MHA relayout (e.g. llama-160m's 12x64 -> use 6 for 6x128).",
+    )
     parser.add_argument("--output_dir", default=str(ROOT / "voyager_out" / "milestone1"))
     parser.add_argument("--csv", default=None, help="CSV path; defaults to <output_dir>/decode_sweep.csv")
     parser.add_argument("--voyager_root", default=str(DEFAULT_VOYAGER_ROOT))
@@ -143,10 +152,23 @@ def main() -> None:
     print(f"mixed precision: {args.enable_mixed_precision}, single layer: {not args.full_model}")
 
     dtype = torch.bfloat16 if args.bf16 else torch.float16
+    head_overrides = {}
+    if args.num_attention_heads is not None:
+        from transformers import AutoConfig
+
+        base_config = AutoConfig.from_pretrained(args.model_name_or_path)
+        if base_config.hidden_size % args.num_attention_heads:
+            raise ValueError("hidden_size must divide evenly by --num_attention_heads")
+        head_overrides = {
+            "num_attention_heads": args.num_attention_heads,
+            "num_key_value_heads": args.num_attention_heads,
+            "head_dim": base_config.hidden_size // args.num_attention_heads,
+        }
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=dtype,
         attn_implementation="eager",  # a fused kernel may mangle an explicit 4D mask
+        **head_overrides,
     ).eval()
 
     if not args.full_model:
@@ -309,14 +331,9 @@ def main() -> None:
         transform(
             gm,
             example_args,
-            patterns=build_vector_pipeline(),
-            config=config,
-            transform_layout=getattr(args, "transform_layout", False),
-            transpose_fc=getattr(args, "transpose_fc", False),
-            fuse_reshape=not getattr(args, "disable_reshape_fusion", False),
-            split_spmm=getattr(args, "split_spmm", False),
             context_len=args.context_length,
-            max_gen=128,
+            max_new_tokens=128,
+            **sphinx_transform_args(args, build_vector_pipeline()),
         )
         voyager_compile(
             gm,
@@ -325,6 +342,7 @@ def main() -> None:
             output_dir=str(output_dir),
             output_file=f"decode_N{n}",
             dump_tensors=args.dump_tensors,
+            runtime_tolerance=args.runtime_tolerance,
         )
         stamped = stamp_unplaced_constants_as_dram(gm)
         if stamped:

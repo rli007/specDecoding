@@ -62,6 +62,7 @@ from tools.voyager_common import (
     load_set_qconfig,
     print_rows,
     schedule_row,
+    sphinx_transform_args,
     write_csv,
 )
 
@@ -185,16 +186,7 @@ def main() -> None:
             gm(*example_args)
         convert_pt2e(gm, args.bias)
 
-        transform(
-            gm,
-            example_args,
-            patterns=build_vector_pipeline(),
-            config=config,
-            transform_layout=getattr(args, "transform_layout", False),
-            transpose_fc=getattr(args, "transpose_fc", False),
-            fuse_reshape=not getattr(args, "disable_reshape_fusion", False),
-            split_spmm=getattr(args, "split_spmm", False),
-        )
+        transform(gm, example_args, **sphinx_transform_args(args, build_vector_pipeline()))
         voyager_compile(
             gm,
             example_args,
@@ -202,6 +194,7 @@ def main() -> None:
             output_dir=str(output_dir),
             output_file=f"medusa_heads_P{p}",
             dump_tensors=args.dump_tensors,
+            runtime_tolerance=args.runtime_tolerance,
         )
         result = report(gm, config, output_dir=str(output_dir), basename=f"medusa_heads_P{p}")
         rows.append(schedule_row(f"medusa_heads_P{p}", p, result, config))

@@ -23,6 +23,14 @@ The user understands the research and the math but is still learning industry
 vocabulary and toolchains. Explain terms; do not assume tribal knowledge.
 Prefer building understanding from low-level mechanism upward.
 
+**How to communicate (user preference, 2026-08-05):** Be concise — no walls
+of text, no jargon dumps. Teach like a tutor: start from the simple version,
+confirm understanding, then prompt forward to the next level rather than
+front-loading everything. Always surface the *practical* layer: exact
+terminal commands, crucial decisions and the why behind them, and operational
+habits (cost control, backups, code/data provenance) — the user wants these
+to grow as a software/hardware engineer.
+
 **This repo is not a product.** It is a from-scratch, deliberately inspectable
 implementation of speculative decoding methods, built so their tensor
 operations can be mapped onto Sphinx and cost-modeled.
@@ -636,8 +644,11 @@ the real branch becomes load-bearing.
 
 ## 9. Environment
 
-- Local: macOS / MPS. `transformers` 5.6.2, `torch` 2.11.0 (`requirements.txt`
-  floors are much lower: `transformers>=4.45`). The `DynamicCache.layers[i].keys`
+- Local: macOS / MPS. As of 2026-08-06: `transformers` 5.13.0, `torch` 2.12.1,
+  python 3.13.9 (`requirements.txt` floors are much lower). NOTE: the Modal
+  image pins `transformers==5.6.2` / `torch==2.11.*` — local and cloud envs
+  have diverged; acceptance numbers are env-independent but keep it in mind
+  for cache-layout code. The `DynamicCache.layers[i].keys`
   layout that `_copy_selected_tree_cache` relies on is a **recent-transformers**
   detail — if it breaks after an upgrade, that function's `return False`
   guards degrade to re-prefill rather than corrupting state.
@@ -653,18 +664,36 @@ the real branch becomes load-bearing.
 
 ## 10. 2026-08-05 update: run-count pipeline, Modal GPU infra, voyager refresh
 
-### Repo changes (UNCOMMITTED as of writing — commit before the next big run)
+### Repo changes (committed by Ryan through `cc869a9`, 2026-08-05)
 
 - **Voyager clone updated** `946a222` → `900be4f` (= origin/main, now a `src/`
   layout; a local `main` branch tracks origin so plain `git pull` works).
   Import fixes applied here (`voyager_compiler.hardware` →
   `hardware_config` in `tools/voyager_common.py` + both milestone scripts).
-  **Still broken: `transform()` API drift** — upstream threads one
-  `AcceleratorConfig` through `get_transform_args()` (`test` utils); the
-  milestone scripts fail at their `transform(...)` call until realigned.
-  Upstream cost model also changed (per-tile launch charges, GEMM tile
-  repricing): **all recorded sweep numbers (incl. N\*≈65) are stale** — re-run
-  before quoting.
+  **Realignment DONE 2026-08-05 late:** `transform()` now takes one
+  `AcceleratorConfig` + `layout_policy` (see `sphinx_transform_args()` in
+  `voyager_common.py`, mirroring upstream `get_transform_args`); both
+  milestone scripts updated and re-verified. `stamp_unplaced_constants_as_dram`
+  is STILL required (232 constants at N=1) and `dram_kv_bytes` still reads 0 —
+  both remain open mentor questions.
+  **Refreshed sweep (64 GB/s, new cost model, single layer + lm_head,
+  `voyager_out/milestone1_64gbs/decode_sweep.csv`):** N=1 5.80 ms; flat
+  ~13.8k cycles/token through N=64 (1.15×); compute-bound ~90k cycles/token
+  above (N=96 1.64×, N=128 2.15×); two-line fit knee **N\* ≈ 66** (July: 65 —
+  conclusion unchanged, now on current model).
+  **NEW BLOCKER — multi-layer export bug:** exporting ANY wrapper with ≥2
+  decoder layers via `export_model` fails in torch.export fake-tensor tracing
+  (`aten.mul` broadcast error in apply_rotary_pos_emb, q arrives [1,1,128,6]
+  instead of [1,6,1,128]); 1 layer exports fine. Bisected: not the mask, not
+  the checkpoint, not head geometry — layer count. Means `--full_model` was
+  never actually usable (July verified single-layer only) and the llama-160m
+  draft-model compile is blocked. Minimal repro: load any Llama, prefill a
+  StaticCache, export a 2-layer wrapper. **Full report + runnable repro:
+  `VOYAGER_BUG_REPORT.md` + `tools/repro_voyager_multilayer_export_bug.py`**
+  (verified 2026-08-06: plain torch.export fails identically → torch/HF-side
+  root cause, but it breaks the llm_decode wrapper pattern). Until fixed,
+  draft-step cost uses roofline bounds (~1.5–4 ms for 160M at nf4_6 +
+  scales ≈ 94 MB @ 64 GB/s).
 - **Bandwidth assumption is now 64 GB/s** (`SPHINX_DRAM_BANDWIDTH_GBS` in
   `tools/voyager_common.py`; was 68 — all §6/§7 prose figures above used 68).
 - **New run-count pipeline** (per-component invocation logging for the
@@ -691,6 +720,19 @@ the real branch becomes load-bearing.
   runs (greedy device-independence confirmed empirically). Note ISSCC 31.8
   (Tsinghua) drafts a *tree* (top-k per draft step), not a chain — its
   numbers are not directly comparable to HF-style assisted decoding.
+
+### Measured acceptance + predicted speedup (2026-08-05, 20 MT-Bench q × 512 tok)
+
+Data: `run_logs/modal/gpu_suite_limit20/` (also on the results volume).
+tokens/step — greedy / typical(t=0.7): tree64 2.40/2.58, tree32 2.28/2.46,
+tree16 2.07/2.25, tree8 1.91/2.02, tree4 1.74/1.86; assisted k=5 2.51;
+baseline 1.00. Combined with the refreshed sweep (step cost 1.15× at N=64,
+1.09× at N=32): **predicted Sphinx speedup ~2.1× for Medusa greedy with a
+flat optimum across N=32..64** (2.25× typical); assisted lands ~1.9–2.2×
+(draft cost roofline-bounded, see export bug above) — **too close to call
+until the draft model compiles.** Assisted acceptance at real lengths (2.51)
+beats Medusa tree-64 (2.40): the smoke run's short-generation bias had
+hidden this.
 
 ### Modal GPU infrastructure (account `ryan10035869`)
 
